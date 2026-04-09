@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket Pipeline — Live Terminal Dashboard
+Kalshi Pipeline — Live Terminal Dashboard
 Bloomberg Terminal aesthetic. Runs the real pipeline on a loop.
 """
 from __future__ import annotations
@@ -134,7 +134,7 @@ def render_header() -> Panel:
     grid.add_column(justify="center", ratio=2)
     grid.add_column(justify="right", ratio=1)
     grid.add_row(
-        Text(" POLYMARKET PIPELINE", style="bold bright_green"),
+        Text(" KALSHI PIPELINE", style="bold bright_green"),
         Text("NEWS SCRAPER + AI CONFIDENCE SCORER + AUTO TRADER", style=DIM),
         Text(f"{now} ", style=MUTED),
     )

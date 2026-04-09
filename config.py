@@ -6,13 +6,15 @@ load_dotenv()
 # --- Anthropic ---
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# --- Polymarket CLOB ---
-POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
-POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
-POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
-POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-POLYMARKET_HOST = "https://clob.polymarket.com"
-POLYMARKET_WS_HOST = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# --- Kalshi ---
+KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")  # path to RSA PEM file
+KALSHI_HOST = os.getenv("KALSHI_HOST", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_WS_HOST = os.getenv("KALSHI_WS_HOST", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+KALSHI_DEMO = os.getenv("KALSHI_DEMO", "false").lower() == "true"
+if KALSHI_DEMO:
+    KALSHI_HOST = "https://demo-api.kalshi.co/trade-api/v2"
+    KALSHI_WS_HOST = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
 # --- Twitter API v2 ---
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "")
@@ -49,6 +51,7 @@ MATERIALITY_THRESHOLD = float(os.getenv("MATERIALITY_THRESHOLD", "0.6"))
 SPEED_TARGET_SECONDS = float(os.getenv("SPEED_TARGET_SECONDS", "5"))
 CLASSIFICATION_MODEL = "claude-haiku-4-5-20251001"
 SCORING_MODEL = "claude-sonnet-4-6-20250514"
+CLAUDE_MODEL = SCORING_MODEL  # alias used by scorer.py
 
 # --- Categories to track ---
 MARKET_CATEGORIES = [

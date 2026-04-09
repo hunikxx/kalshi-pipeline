@@ -1,5 +1,5 @@
 #!/bin/bash
-# Polymarket Pipeline V2 — One-Command Setup
+# Kalshi Pipeline V2 — One-Command Setup
 # Usage: bash setup.sh
 
 set -e
@@ -11,7 +11,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 echo ""
-echo -e "${GREEN}${BOLD}  POLYMARKET PIPELINE V2 — SETUP${NC}"
+echo -e "${GREEN}${BOLD}  KALSHI PIPELINE V2 — SETUP${NC}"
 echo -e "${GREEN}  Breaking News Detector + AI Classifier + Niche Market Trader${NC}"
 echo ""
 
@@ -81,16 +81,13 @@ else
     fi
     echo ""
 
-    # Polymarket (optional)
-    echo -e "${YELLOW}4. Polymarket API Credentials${NC} (optional — needed only for live trading)"
-    read -p "   Enter Polymarket API key (or press Enter to skip): " POLY_KEY
-    POLY_SECRET=""
-    POLY_PASS=""
-    POLY_PRIV=""
-    if [ -n "$POLY_KEY" ]; then
-        read -p "   Enter Polymarket API secret: " POLY_SECRET
-        read -p "   Enter Polymarket API passphrase: " POLY_PASS
-        read -p "   Enter Polymarket private key: " POLY_PRIV
+    # Kalshi (optional)
+    echo -e "${YELLOW}4. Kalshi API Credentials${NC} (optional — needed only for live trading)"
+    echo "   Generate at https://kalshi.com/settings/api"
+    read -p "   Enter Kalshi API key ID (or press Enter to skip): " KALSHI_KEY_ID
+    KALSHI_PEM_PATH=""
+    if [ -n "$KALSHI_KEY_ID" ]; then
+        read -p "   Enter path to RSA private key PEM file: " KALSHI_PEM_PATH
     fi
     echo ""
 
@@ -111,11 +108,9 @@ TWITTER_BEARER_TOKEN=${TWITTER_KEY}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_KEY}
 TELEGRAM_CHANNEL_IDS=${TELEGRAM_CHANNELS}
 
-# Polymarket CLOB API (optional — live trading)
-POLYMARKET_API_KEY=${POLY_KEY}
-POLYMARKET_API_SECRET=${POLY_SECRET}
-POLYMARKET_API_PASSPHRASE=${POLY_PASS}
-POLYMARKET_PRIVATE_KEY=${POLY_PRIV}
+# Kalshi API (optional — live trading)
+KALSHI_API_KEY_ID=${KALSHI_KEY_ID}
+KALSHI_PRIVATE_KEY_PATH=${KALSHI_PEM_PATH}
 
 # NewsAPI.org (optional)
 NEWSAPI_KEY=${NEWSAPI}

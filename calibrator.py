@@ -11,10 +11,9 @@ import httpx
 
 import config
 import logger
+from markets import fetch_market_by_ticker
 
 log = logging.getLogger(__name__)
-
-GAMMA_API = "https://gamma-api.polymarket.com"
 
 
 @dataclass
@@ -29,7 +28,7 @@ class CalibrationReport:
 def check_resolutions():
     """
     Check if any open trades have resolved. Update calibration table.
-    Queries Gamma API for market resolution status.
+    Queries Kalshi API for market settlement status.
     """
     trades = logger.get_recent_trades(limit=100)
     unresolved = [
@@ -42,39 +41,16 @@ def check_resolutions():
 
     resolved_count = 0
     for trade in unresolved:
-        market_id = trade["market_id"]
+        market_id = trade["market_id"]  # Kalshi ticker
 
         try:
-            resp = httpx.get(
-                f"{GAMMA_API}/markets",
-                params={"condition_id": market_id},
-                timeout=10,
-            )
-            data = resp.json()
-            items = data if isinstance(data, list) else data.get("data", [])
-
-            if not items:
+            market = fetch_market_by_ticker(market_id)
+            if not market or market.active:
                 continue
 
-            market_data = items[0]
-            if not market_data.get("closed", False):
-                continue
-
-            # Market resolved — determine direction
-            outcome_prices = market_data.get("outcomePrices", "")
-            if isinstance(outcome_prices, str):
-                import json
-                try:
-                    prices = json.loads(outcome_prices)
-                except Exception:
-                    continue
-            else:
-                prices = outcome_prices
-
-            if not prices or len(prices) < 2:
-                continue
-
-            exit_price = float(prices[0])
+            # Market settled — check final price
+            # On Kalshi, a settled market has yes_price = 1.0 (YES won) or 0.0 (NO won)
+            exit_price = market.yes_price
             entry_price = trade["market_price"]
 
             if exit_price > entry_price:

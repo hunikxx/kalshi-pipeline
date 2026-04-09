@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Polymarket Pipeline — CLI Interface
+Kalshi Pipeline — CLI Interface
 
 Usage:
     python cli.py watch                # V2: Event-driven pipeline (real-time news → classify → trade)
@@ -143,7 +143,7 @@ def cmd_verify(args):
     """Check all API keys and connections work."""
     from rich.panel import Panel
 
-    console.print(Panel("[bold]POLYMARKET PIPELINE V2 — VERIFICATION[/bold]", style="bright_green"))
+    console.print(Panel("[bold]KALSHI PIPELINE V2 — VERIFICATION[/bold]", style="bright_green"))
     all_good = True
 
     # 1. Python version
@@ -156,7 +156,7 @@ def cmd_verify(args):
 
     # 2. Dependencies
     deps_ok = True
-    for mod in ["anthropic", "feedparser", "httpx", "rich", "dotenv", "websockets", "tweepy", "aiohttp"]:
+    for mod in ["anthropic", "feedparser", "httpx", "rich", "dotenv", "websockets", "cryptography"]:
         try:
             __import__(mod)
         except ImportError:
@@ -216,13 +216,13 @@ def cmd_verify(args):
     else:
         console.print(f"  [dim]SKIP[/dim]  Telegram bot (optional — enables channel monitoring)")
 
-    # 8. Polymarket API
+    # 8. Kalshi API
     try:
         from markets import fetch_active_markets
         mkts = fetch_active_markets(limit=5)
-        console.print(f"  [bright_green]PASS[/bright_green]  Polymarket API ({len(mkts)} markets)")
+        console.print(f"  [bright_green]PASS[/bright_green]  Kalshi API ({len(mkts)} markets)")
     except Exception as e:
-        console.print(f"  [yellow]WARN[/yellow]  Polymarket API — {e}")
+        console.print(f"  [yellow]WARN[/yellow]  Kalshi API — {e}")
 
     # 9. Niche market filter
     try:
@@ -234,12 +234,20 @@ def cmd_verify(args):
     except Exception as e:
         console.print(f"  [yellow]WARN[/yellow]  Niche filter — {e}")
 
-    # 10. Polymarket trading credentials (optional)
-    has_poly = bool(config.POLYMARKET_API_KEY)
-    if has_poly:
-        console.print(f"  [bright_green]PASS[/bright_green]  Polymarket trading credentials set")
+    # 10. Kalshi trading credentials (optional)
+    has_kalshi = bool(config.KALSHI_API_KEY_ID) and bool(config.KALSHI_PRIVATE_KEY_PATH)
+    if has_kalshi:
+        try:
+            from kalshi_auth import _load_private_key
+            key = _load_private_key()
+            if key:
+                console.print(f"  [bright_green]PASS[/bright_green]  Kalshi trading credentials (key loaded)")
+            else:
+                console.print(f"  [yellow]WARN[/yellow]  Kalshi private key file not found")
+        except Exception as e:
+            console.print(f"  [yellow]WARN[/yellow]  Kalshi credentials — {e}")
     else:
-        console.print(f"  [dim]SKIP[/dim]  Polymarket trading credentials (optional — needed for --live)")
+        console.print(f"  [dim]SKIP[/dim]  Kalshi trading credentials (optional — needed for --live)")
 
     # 11. SQLite
     try:
@@ -378,7 +386,7 @@ def cmd_stats(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket Pipeline V2")
+    parser = argparse.ArgumentParser(description="Kalshi Pipeline V2")
     sub = parser.add_subparsers(dest="command")
 
     # watch (V2)

@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 
 import httpx
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
@@ -18,11 +19,10 @@ import config
 from markets import Market
 from classifier import classify
 from edge import size_position
+from kalshi_auth import auth_headers
 
 log = logging.getLogger(__name__)
 console = Console()
-
-GAMMA_API = "https://gamma-api.polymarket.com"
 
 
 @dataclass
@@ -51,55 +51,62 @@ class BacktestReport:
 
 
 def fetch_resolved_markets(limit: int = 50, category: str | None = None) -> list[dict]:
-    """Fetch recently resolved markets from Gamma API."""
-    params = {
-        "limit": limit,
-        "closed": True,
-        "order": "volume",
-        "ascending": False,
+    """Fetch recently settled markets from Kalshi API."""
+    endpoint = "/markets"
+    path = urlparse(f"{config.KALSHI_HOST}{endpoint}").path
+    headers = auth_headers("GET", path)
+
+    params: dict = {
+        "status": "settled",
+        "limit": min(limit, 200),
     }
 
     try:
-        resp = httpx.get(f"{GAMMA_API}/markets", params=params, timeout=15)
+        resp = httpx.get(
+            f"{config.KALSHI_HOST}{endpoint}",
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         console.print(f"[red]Error fetching resolved markets: {e}[/red]")
         return []
 
-    items = data if isinstance(data, list) else data.get("data", [])
-
     markets = []
-    for m in items:
+    for m in data.get("markets", []):
         try:
-            import json
-            outcome_prices = m.get("outcomePrices", "")
-            if isinstance(outcome_prices, str):
-                prices = json.loads(outcome_prices)
-            else:
-                prices = outcome_prices
-
-            if not prices or len(prices) < 2:
-                continue
-
-            vol = float(m.get("volume", m.get("volumeNum", 0)) or 0)
+            vol = float(m.get("volume_fp", 0) or 0)
             if vol < config.MIN_VOLUME_USD or vol > config.MAX_VOLUME_USD:
                 continue
 
-            question = m.get("question", "")
+            title = m.get("title", m.get("yes_sub_title", ""))
+            result = m.get("result", "")
+
             if category:
                 from markets import _infer_category
-                cat = _infer_category(question, m.get("tags") or [])
+                cat = _infer_category(title, m.get("category", ""))
                 if cat != category:
                     continue
 
+            # Determine resolved price from result
+            if result == "yes":
+                resolved_price = 1.0
+            elif result == "no":
+                resolved_price = 0.0
+            else:
+                continue  # skip markets without clear resolution
+
+            last_price = float(m.get("previous_price_dollars", 0.5) or 0.5)
+
             markets.append({
-                "question": question,
-                "condition_id": m.get("conditionId", m.get("condition_id", "")),
-                "yes_price_at_open": 0.5,  # approximation
-                "resolved_yes_price": float(prices[0]),
+                "question": title,
+                "condition_id": m.get("ticker", ""),
+                "yes_price_at_open": last_price,
+                "resolved_yes_price": resolved_price,
                 "volume": vol,
-                "category": m.get("tags", []),
+                "category": m.get("category", ""),
             })
         except (ValueError, TypeError, KeyError):
             continue

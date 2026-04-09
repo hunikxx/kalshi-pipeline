@@ -1,5 +1,5 @@
 """
-Polymarket WebSocket subscriber — live price feed + niche market filtering.
+Kalshi WebSocket subscriber — live price feed + niche market filtering.
 Maintains a live snapshot of tracked markets and detects momentum shifts.
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import config
 from markets import Market, fetch_active_markets, filter_by_categories
+from kalshi_auth import auth_headers
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class MarketSnapshot:
 
 
 class MarketWatcher:
-    """Watches niche Polymarket markets via WebSocket + periodic Gamma API refresh."""
+    """Watches niche Kalshi markets via WebSocket + periodic REST refresh."""
 
     def __init__(self):
         self.snapshots: dict[str, MarketSnapshot] = {}
@@ -53,7 +54,7 @@ class MarketWatcher:
         ]
 
     async def refresh_markets(self):
-        """Fetch and filter markets from Gamma API."""
+        """Fetch and filter markets from Kalshi API."""
         try:
             all_markets = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: fetch_active_markets(limit=200)
@@ -77,9 +78,8 @@ class MarketWatcher:
                     )
                 else:
                     snap = self.snapshots[m.condition_id]
-                    snap.market = m  # update metadata
+                    snap.market = m
 
-            # Remove stale snapshots
             for stale_id in existing_ids - new_ids:
                 del self.snapshots[stale_id]
 
@@ -90,7 +90,7 @@ class MarketWatcher:
             log.warning(f"[watcher] Market refresh error: {e}")
 
     async def _connect_websocket(self):
-        """Connect to Polymarket WebSocket for live price updates."""
+        """Connect to Kalshi WebSocket for live price updates."""
         try:
             import websockets
         except ImportError:
@@ -99,27 +99,38 @@ class MarketWatcher:
 
         while True:
             try:
-                async with websockets.connect(config.POLYMARKET_WS_HOST) as ws:
-                    self._ws_connected = True
-                    log.info("[watcher] WebSocket connected")
+                # Kalshi WS requires auth headers
+                ws_path = "/trade-api/ws/v2"
+                headers = auth_headers("GET", ws_path)
 
-                    # Subscribe to tracked markets
-                    for market in self.tracked_markets:
-                        for token in market.tokens:
-                            tid = token.get("token_id")
-                            if tid:
-                                sub = {"type": "subscribe", "channel": "price", "market": tid}
-                                await ws.send(json.dumps(sub))
+                async with websockets.connect(
+                    config.KALSHI_WS_HOST,
+                    additional_headers=headers,
+                ) as ws:
+                    self._ws_connected = True
+                    log.info("[watcher] Kalshi WebSocket connected")
+
+                    # Subscribe to ticker channel for tracked markets
+                    tickers = [m.condition_id for m in self.tracked_markets]
+                    if tickers:
+                        sub = {
+                            "id": 1,
+                            "cmd": "subscribe",
+                            "params": {
+                                "channels": ["ticker"],
+                                "market_tickers": tickers[:100],  # cap subscriptions
+                            },
+                        }
+                        await ws.send(json.dumps(sub))
 
                     # Listen for updates
                     while True:
                         try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                            msg = await asyncio.wait_for(ws.recv(), timeout=15)
                             self.stats["ws_messages"] += 1
                             data = json.loads(msg)
                             self._handle_ws_message(data)
                         except asyncio.TimeoutError:
-                            # Send ping
                             await ws.ping()
 
             except Exception as e:
@@ -128,33 +139,35 @@ class MarketWatcher:
                 await asyncio.sleep(5)
 
     def _handle_ws_message(self, data: dict):
-        """Process a WebSocket price update."""
+        """Process a Kalshi WebSocket ticker update."""
         msg_type = data.get("type", "")
-        if msg_type not in ("price_change", "last_trade_price"):
+        if msg_type != "ticker":
             return
 
-        market_id = data.get("market", data.get("condition_id", ""))
-        price = data.get("price")
+        msg = data.get("msg", {})
+        ticker = msg.get("market_ticker", "")
+        price = msg.get("yes_price")
+        if price is None:
+            price = msg.get("last_price_dollars")
 
-        if not market_id or price is None:
+        if not ticker or price is None:
             return
 
-        # Find matching snapshot
-        for cid, snap in self.snapshots.items():
-            token_ids = [t.get("token_id", "") for t in snap.market.tokens]
-            if market_id in token_ids or market_id == cid:
-                now = datetime.now(timezone.utc)
-                elapsed = (now - snap.last_update).total_seconds()
-                snap.prev_price = snap.last_price
-                snap.last_price = float(price)
-                snap.last_update = now
-                if elapsed > 0:
-                    snap.momentum = (snap.last_price - snap.prev_price) / (elapsed / 60)
-                self.stats["price_updates"] += 1
-                break
+        snap = self.snapshots.get(ticker)
+        if not snap:
+            return
+
+        now = datetime.now(timezone.utc)
+        elapsed = (now - snap.last_update).total_seconds()
+        snap.prev_price = snap.last_price
+        snap.last_price = float(price)
+        snap.last_update = now
+        if elapsed > 0:
+            snap.momentum = (snap.last_price - snap.prev_price) / (elapsed / 60)
+        self.stats["price_updates"] += 1
 
     async def _polling_fallback(self):
-        """Poll Gamma API for price updates when WebSocket unavailable."""
+        """Poll Kalshi API for price updates when WebSocket unavailable."""
         while True:
             await asyncio.sleep(30)
             if self._ws_connected:
@@ -195,6 +208,6 @@ if __name__ == "__main__":
         await watcher.refresh_markets()
         print(f"Tracking {len(watcher.tracked_markets)} niche markets:")
         for m in watcher.tracked_markets[:10]:
-            print(f"  [{m.category}] ${m.volume:,.0f} | YES:{m.yes_price:.2f} | {m.question[:60]}")
+            print(f"  [{m.category}] vol:{m.volume:,.0f} | YES:{m.yes_price:.2f} | {m.question[:60]}")
 
     asyncio.run(_test())

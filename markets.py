@@ -1,189 +1,201 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 
 import config
-
-GAMMA_API = "https://gamma-api.polymarket.com"
+from kalshi_auth import auth_headers
 
 
 @dataclass
 class Market:
-    condition_id: str
-    question: str
+    condition_id: str  # Kalshi ticker (e.g. "KXINFLATION-25JUN")
+    question: str      # market title / yes_sub_title
     category: str
-    yes_price: float
+    yes_price: float   # last yes price in dollars (0.0 - 1.0)
     no_price: float
-    volume: float
-    end_date: str
+    volume: float      # 24h volume in contracts
+    end_date: str      # close_time ISO string
     active: bool
-    tokens: list[dict]
+    tokens: list[dict]  # kept for compatibility — [{token_id, outcome, price}]
+    event_ticker: str = ""
+    liquidity: float = 0.0
 
     @property
     def implied_probability(self) -> float:
         return self.yes_price
 
 
+def _api_path(endpoint: str) -> str:
+    """Extract the path portion for signing from a full URL."""
+    parsed = urlparse(f"{config.KALSHI_HOST}{endpoint}")
+    return parsed.path
+
+
 def fetch_active_markets(limit: int = 50) -> list[Market]:
-    """Fetch active, liquid markets from Polymarket's Gamma API."""
+    """Fetch active markets from Kalshi API."""
     markets = []
+    cursor = None
 
-    try:
-        resp = httpx.get(
-            f"{GAMMA_API}/markets",
-            params={
-                "limit": limit,
-                "active": True,
-                "closed": False,
-                "order": "volume",
-                "ascending": False,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[markets] Gamma API error: {e}, falling back to CLOB...")
-        return _fetch_from_clob(limit)
+    while len(markets) < limit:
+        params: dict = {
+            "status": "open",
+            "limit": min(limit - len(markets), 200),
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-    items = data if isinstance(data, list) else data.get("data", [])
+        endpoint = "/markets"
+        path = _api_path(endpoint)
+        headers = auth_headers("GET", path)
 
-    for m in items:
         try:
-            # Gamma API uses outcomePrices as a JSON string
-            outcome_prices = m.get("outcomePrices", "")
-            yes_price = 0.5
-            no_price = 0.5
+            resp = httpx.get(
+                f"{config.KALSHI_HOST}{endpoint}",
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[markets] Kalshi API error: {e}")
+            return markets
 
-            if outcome_prices:
-                import json
-                try:
-                    prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
-                    if len(prices) >= 2:
-                        yes_price = float(prices[0])
-                        no_price = float(prices[1])
-                except (json.JSONDecodeError, ValueError):
-                    pass
+        for m in data.get("markets", []):
+            try:
+                yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
+                yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
+                no_bid = float(m.get("no_bid_dollars", 0) or 0)
+                no_ask = float(m.get("no_ask_dollars", 0) or 0)
 
-            # Also check tokens array
-            tokens = m.get("tokens", m.get("clobTokenIds", []))
-            if isinstance(tokens, str):
-                import json
-                try:
-                    tokens = json.loads(tokens)
-                except json.JSONDecodeError:
-                    tokens = []
+                # Mid price, or last trade price
+                last_price = float(m.get("last_price_dollars", 0) or 0)
+                yes_price = last_price if last_price > 0 else (yes_bid + yes_ask) / 2 if (yes_bid + yes_ask) > 0 else 0.5
+                no_price = 1.0 - yes_price
 
-            # Build token list for order execution
-            clob_token_ids = m.get("clobTokenIds", "")
-            if isinstance(clob_token_ids, str):
-                import json
-                try:
-                    clob_token_ids = json.loads(clob_token_ids)
-                except json.JSONDecodeError:
-                    clob_token_ids = []
+                vol_24h = float(m.get("volume_24h_fp", 0) or 0)
+                vol_total = float(m.get("volume_fp", 0) or 0)
+                liquidity = float(m.get("liquidity_dollars", 0) or 0)
 
-            token_list = []
-            outcomes = ["Yes", "No"]
-            for i, tid in enumerate(clob_token_ids if isinstance(clob_token_ids, list) else []):
-                token_list.append({
-                    "token_id": tid,
-                    "outcome": outcomes[i] if i < len(outcomes) else f"Outcome_{i}",
-                    "price": yes_price if i == 0 else no_price,
-                })
+                ticker = m.get("ticker", "")
+                title = m.get("title", m.get("yes_sub_title", ticker))
+                status = m.get("status", "")
 
-            vol = float(m.get("volume", m.get("volumeNum", 0)) or 0)
-            question = m.get("question", "")
+                if status != "open":
+                    continue
 
-            # Skip resolved or low-info markets
-            if yes_price in (0.0, 1.0) and vol == 0:
+                # Build token-like structure for compatibility
+                token_list = [
+                    {"token_id": ticker, "outcome": "Yes", "price": yes_price},
+                    {"token_id": ticker, "outcome": "No", "price": no_price},
+                ]
+
+                markets.append(Market(
+                    condition_id=ticker,
+                    question=title,
+                    category=_infer_category(title, m.get("category", "")),
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    volume=vol_24h if vol_24h > 0 else vol_total,
+                    end_date=m.get("close_time", m.get("latest_expiration_time", "")),
+                    active=True,
+                    tokens=token_list,
+                    event_ticker=m.get("event_ticker", ""),
+                    liquidity=liquidity,
+                ))
+            except (KeyError, ValueError, TypeError):
                 continue
 
-            markets.append(Market(
-                condition_id=m.get("conditionId", m.get("condition_id", m.get("id", ""))),
-                question=question,
-                category=_infer_category(question, m.get("tags", None) or []),
-                yes_price=yes_price,
-                no_price=no_price,
-                volume=vol,
-                end_date=m.get("endDate", m.get("end_date_iso", "")),
-                active=m.get("active", True),
-                tokens=token_list,
-            ))
-        except (KeyError, ValueError, TypeError):
-            continue
+        cursor = data.get("cursor")
+        if not cursor:
+            break
 
-    # Sort by volume descending
     markets.sort(key=lambda x: x.volume, reverse=True)
     return markets
 
 
-def _fetch_from_clob(limit: int) -> list[Market]:
-    """Fallback: fetch from CLOB API directly."""
-    markets = []
+def fetch_market_by_ticker(ticker: str) -> Market | None:
+    """Fetch a single market by ticker."""
+    endpoint = f"/markets/{ticker}"
+    path = _api_path(endpoint)
+    headers = auth_headers("GET", path)
+
     try:
         resp = httpx.get(
-            f"{config.POLYMARKET_HOST}/markets",
-            params={"limit": limit, "active": True},
-            timeout=15,
+            f"{config.KALSHI_HOST}{endpoint}",
+            headers=headers,
+            timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[markets] CLOB API error: {e}")
-        return markets
+        m = resp.json().get("market", {})
+    except Exception:
+        return None
 
-    items = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+    if not m:
+        return None
 
-    for m in items:
-        try:
-            tokens = m.get("tokens", [])
-            yes_price = 0.5
-            no_price = 0.5
-            for t in tokens:
-                outcome = t.get("outcome", "").lower()
-                price = float(t.get("price", 0.5))
-                if outcome == "yes":
-                    yes_price = price
-                elif outcome == "no":
-                    no_price = price
+    last_price = float(m.get("last_price_dollars", 0) or 0)
+    yes_price = last_price if last_price > 0 else 0.5
 
-            markets.append(Market(
-                condition_id=m.get("condition_id", m.get("id", "")),
-                question=m.get("question", ""),
-                category=_infer_category(m.get("question", ""), m.get("tags") or []),
-                yes_price=yes_price,
-                no_price=no_price,
-                volume=float(m.get("volume", 0)),
-                end_date=m.get("end_date_iso", m.get("end_date", "")),
-                active=m.get("active", True),
-                tokens=tokens,
-            ))
-        except (KeyError, ValueError):
-            continue
-
-    return markets
+    return Market(
+        condition_id=m.get("ticker", ticker),
+        question=m.get("title", ""),
+        category=_infer_category(m.get("title", ""), m.get("category", "")),
+        yes_price=yes_price,
+        no_price=1.0 - yes_price,
+        volume=float(m.get("volume_24h_fp", 0) or 0),
+        end_date=m.get("close_time", ""),
+        active=m.get("status") == "open",
+        tokens=[
+            {"token_id": ticker, "outcome": "Yes", "price": yes_price},
+            {"token_id": ticker, "outcome": "No", "price": 1.0 - yes_price},
+        ],
+        event_ticker=m.get("event_ticker", ""),
+        liquidity=float(m.get("liquidity_dollars", 0) or 0),
+    )
 
 
-def _infer_category(question: str, tags: list) -> str:
-    """Infer category from question text and tags."""
-    q = question.lower()
-    tag_str = " ".join(str(t).lower() for t in tags)
-    combined = f"{q} {tag_str}"
+def fetch_orderbook(ticker: str) -> dict:
+    """Fetch order book for a market. Returns {yes_bids, yes_asks, no_bids, no_asks}."""
+    endpoint = f"/markets/{ticker}/orderbook"
+    path = _api_path(endpoint)
+    headers = auth_headers("GET", path)
 
-    if any(kw in combined for kw in ["ai", "artificial intelligence", "openai", "chatgpt", "llm", "google ai", "anthropic"]):
+    try:
+        resp = httpx.get(
+            f"{config.KALSHI_HOST}{endpoint}",
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json().get("orderbook", {})
+    except Exception:
+        return {}
+
+
+def _infer_category(title: str, kalshi_category: str) -> str:
+    """Infer category from title and Kalshi's own category field."""
+    combined = f"{title} {kalshi_category}".lower()
+
+    if any(kw in combined for kw in ["ai", "artificial intelligence", "openai", "chatgpt", "llm", "anthropic"]):
         return "ai"
-    if any(kw in combined for kw in ["bitcoin", "ethereum", "crypto", "blockchain", "defi", "token"]):
+    if any(kw in combined for kw in ["bitcoin", "ethereum", "crypto", "blockchain", "defi"]):
         return "crypto"
-    if any(kw in combined for kw in ["election", "president", "congress", "senate", "trump", "biden", "political"]):
+    if any(kw in combined for kw in ["election", "president", "congress", "senate", "trump", "biden", "political", "politics"]):
         return "politics"
-    if any(kw in combined for kw in ["spacex", "nasa", "climate", "research", "study", "discovery"]):
+    if any(kw in combined for kw in ["spacex", "nasa", "climate", "research", "discovery"]):
         return "science"
     if any(kw in combined for kw in ["tech", "apple", "google", "microsoft", "software", "startup"]):
         return "technology"
-    return "other"
+    if any(kw in combined for kw in ["econ", "gdp", "inflation", "fed", "interest rate", "cpi", "jobs", "unemployment"]):
+        return "economy"
+    if any(kw in combined for kw in ["weather", "hurricane", "temperature", "storm"]):
+        return "weather"
+    return kalshi_category if kalshi_category else "other"
 
 
 def filter_by_categories(markets: list[Market], categories: list[str] | None = None) -> list[Market]:
@@ -193,11 +205,8 @@ def filter_by_categories(markets: list[Market], categories: list[str] | None = N
 
 
 def get_token_id(market: Market, side: str) -> str | None:
-    """Get the token ID for a given side (YES/NO)."""
-    for t in market.tokens:
-        if t.get("outcome", "").upper() == side.upper():
-            return t.get("token_id")
-    return None
+    """Get the ticker for a given side. On Kalshi the ticker is the same for both sides."""
+    return market.condition_id
 
 
 if __name__ == "__main__":
@@ -206,5 +215,5 @@ if __name__ == "__main__":
     print(f"\n--- {len(filtered)} markets in target categories (of {len(all_markets)} total) ---\n")
     for m in filtered[:15]:
         print(f"  [{m.category}] {m.question}")
-        print(f"    YES: {m.yes_price:.2f} | NO: {m.no_price:.2f} | Vol: ${m.volume:,.0f}")
+        print(f"    YES: {m.yes_price:.2f} | NO: {m.no_price:.2f} | Vol: {m.volume:,.0f} contracts")
         print()

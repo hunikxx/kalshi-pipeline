@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
+from urllib.parse import urlparse
+
+import httpx
 
 import config
 import logger
 from edge import Signal
-from markets import get_token_id
+from kalshi_auth import sign_request
 
 
 def execute_trade(signal: Signal) -> dict:
-    """Execute a trade on Polymarket or log a dry-run. Synchronous."""
+    """Execute a trade on Kalshi or log a dry-run. Synchronous."""
     daily_spent = abs(logger.get_daily_pnl())
     if daily_spent + signal.bet_amount > config.DAILY_LOSS_LIMIT_USD:
         return _log_and_return(signal, status="rejected_daily_limit", order_id=None)
@@ -26,41 +30,48 @@ async def execute_trade_async(signal: Signal) -> dict:
 
 
 def _execute_live(signal: Signal) -> dict:
-    """Place a real order via Polymarket CLOB client."""
+    """Place a real order via Kalshi API."""
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        ticker = signal.market.condition_id
+        side = "yes" if signal.side == "YES" else "no"
+        price = signal.market.yes_price if side == "yes" else signal.market.no_price
 
-        client = ClobClient(
-            host=config.POLYMARKET_HOST,
-            key=config.POLYMARKET_API_KEY,
-            chain_id=137,
-            funder=config.POLYMARKET_PRIVATE_KEY,
+        # Kalshi uses contract counts — at the given price, how many contracts
+        # can we buy with our dollar amount?
+        # Each contract pays $1 on resolution, costs `price` to buy
+        count = int(signal.bet_amount / price) if price > 0 else 0
+        if count < 1:
+            return _log_and_return(signal, status="error_zero_contracts", order_id=None)
+
+        endpoint = "/portfolio/orders"
+        path = urlparse(f"{config.KALSHI_HOST}{endpoint}").path
+        headers = sign_request("POST", path)
+        headers["Content-Type"] = "application/json"
+
+        order_body = {
+            "ticker": ticker,
+            "side": side,
+            "action": "buy",
+            "count": count,
+            "type": "limit",
+            "yes_price": int(price * 100),  # Kalshi uses cents
+            "client_order_id": str(uuid.uuid4()),
+        }
+
+        resp = httpx.post(
+            f"{config.KALSHI_HOST}{endpoint}",
+            headers=headers,
+            json=order_body,
+            timeout=10,
         )
+        resp.raise_for_status()
+        result = resp.json()
 
-        client.set_api_creds(client.create_or_derive_api_creds())
-
-        token_id = get_token_id(signal.market, signal.side)
-        if not token_id:
-            return _log_and_return(signal, status="error_no_token", order_id=None)
-
-        price = signal.market.yes_price if signal.side == "YES" else signal.market.no_price
-
-        order_args = OrderArgs(
-            price=price,
-            size=signal.bet_amount,
-            side="BUY",
-            token_id=token_id,
-        )
-
-        signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
-
-        order_id = resp.get("orderID", resp.get("id", "unknown"))
+        order_id = result.get("order", {}).get("order_id", "unknown")
         return _log_and_return(signal, status="executed", order_id=order_id)
 
-    except ImportError:
-        return _log_and_return(signal, status="error_no_clob_client", order_id=None)
+    except httpx.HTTPStatusError as e:
+        return _log_and_return(signal, status=f"error_http_{e.response.status_code}", order_id=None)
     except Exception as e:
         return _log_and_return(signal, status=f"error_{type(e).__name__}", order_id=None)
 
