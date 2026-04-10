@@ -30,27 +30,40 @@ NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 
 # --- RSS Feeds (fallback) ---
 RSS_FEEDS = [
+    # Tech / AI
     "https://news.google.com/rss/search?q=AI+artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
     "https://feeds.feedburner.com/TechCrunch",
     "https://feeds.arstechnica.com/arstechnica/technology-lab",
     "https://www.theverge.com/rss/index.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
+    # Politics / Economy (matches Kalshi's biggest categories)
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml",
+    "https://feeds.bbci.co.uk/news/politics/rss.xml",
+    "https://news.google.com/rss/search?q=federal+reserve+OR+inflation+OR+tariff+OR+interest+rate&hl=en-US&gl=US&ceid=US:en",
+    # Weather (Kalshi temperature / hurricane markets)
+    "https://news.google.com/rss/search?q=weather+forecast+OR+hurricane+OR+temperature+record&hl=en-US&gl=US&ceid=US:en",
+    # Crypto
+    "https://news.google.com/rss/search?q=bitcoin+OR+ethereum+OR+crypto&hl=en-US&gl=US&ceid=US:en",
+    # Breaking / general
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
 ]
 
 # --- Pipeline Settings ---
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-MAX_BET_USD = float(os.getenv("MAX_BET_USD", "25"))
+MAX_BET_USD = float(os.getenv("MAX_BET_USD", "10"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "100"))
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.10"))
 NEWS_LOOKBACK_HOURS = 6
 
-# --- V2 Settings ---
+# --- V4 Settings ---
 MAX_VOLUME_USD = float(os.getenv("MAX_VOLUME_USD", "500000"))
-MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "1000"))
+MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "0"))
 MATERIALITY_THRESHOLD = float(os.getenv("MATERIALITY_THRESHOLD", "0.6"))
 SPEED_TARGET_SECONDS = float(os.getenv("SPEED_TARGET_SECONDS", "5"))
 CLASSIFICATION_MODEL = "claude-haiku-4-5-20251001"
-SCORING_MODEL = "claude-sonnet-4-6-20250514"
+SCORING_MODEL = "claude-opus-4-6"
 CLAUDE_MODEL = SCORING_MODEL  # alias used by scorer.py
 
 # --- Categories to track ---
@@ -60,6 +73,9 @@ MARKET_CATEGORIES = [
     "crypto",
     "politics",
     "science",
+    "economy",
+    "weather",
+    "other",
 ]
 
 # --- Twitter filter keywords (for filtered stream rules) ---

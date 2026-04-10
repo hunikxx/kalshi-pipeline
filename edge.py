@@ -18,7 +18,7 @@ class Signal:
     bet_amount: float
     reasoning: str
     headlines: str
-    # V2 fields
+    # V4 fields
     news_source: str = ""
     classification: str = ""
     materiality: float = 0.0
@@ -61,13 +61,13 @@ def detect_edge(
     )
 
 
-def detect_edge_v2(
+def detect_edge_v4(
     market: Market,
     classification: Classification,
     news_event: NewsEvent,
 ) -> Signal | None:
     """
-    V2: Use classification direction + materiality instead of probability estimation.
+    V4: Use classification direction + materiality instead of probability estimation.
     Only generates a signal when:
     - Direction is bullish or bearish (not neutral)
     - Materiality exceeds threshold

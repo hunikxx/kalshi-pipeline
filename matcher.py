@@ -79,9 +79,11 @@ def match_news_to_markets_broad(
     category_keywords = {
         "ai": ["ai", "openai", "gpt", "anthropic", "claude", "llm", "chatgpt", "gemini", "artificial intelligence"],
         "crypto": ["bitcoin", "ethereum", "solana", "crypto", "blockchain", "defi", "token", "btc", "eth"],
-        "politics": ["trump", "biden", "congress", "senate", "election", "tariff", "fed", "white house"],
+        "politics": ["trump", "biden", "congress", "senate", "election", "tariff", "fed", "white house", "republican", "democrat"],
         "technology": ["apple", "google", "microsoft", "nvidia", "tech", "software", "startup"],
         "science": ["spacex", "nasa", "climate", "research", "discovery"],
+        "economy": ["inflation", "gdp", "cpi", "jobs", "unemployment", "interest rate", "federal reserve", "recession", "economy"],
+        "weather": ["hurricane", "tornado", "temperature", "storm", "weather", "forecast", "flood"],
     }
 
     matched_categories = set()

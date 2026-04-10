@@ -3,12 +3,12 @@
 Kalshi Pipeline — CLI Interface
 
 Usage:
-    python cli.py watch                # V2: Event-driven pipeline (real-time news → classify → trade)
-    python cli.py watch --live         # V2: With live trading
+    python cli.py watch                # V4: Event-driven pipeline (real-time news → classify → trade)
+    python cli.py watch --live         # V4: With live trading
     python cli.py run                  # V1: Synchronous pipeline (RSS → score → trade)
     python cli.py run --live           # V1: With live trading
     python cli.py dashboard            # Launch live terminal dashboard
-    python cli.py backtest             # Backtest V2 strategy against resolved markets
+    python cli.py backtest             # Backtest V4 strategy against resolved markets
     python cli.py calibrate            # Show classification accuracy report
     python cli.py niche                # Browse niche markets (< $500K volume)
     python cli.py verify               # Check all API keys and connections
@@ -28,9 +28,9 @@ console = Console()
 
 
 def cmd_watch(args):
-    """V2: Event-driven pipeline — real-time news → classify → trade."""
+    """V4: Event-driven pipeline — real-time news → classify → trade."""
     import config
-    from pipeline import run_pipeline_v2
+    from pipeline import run_pipeline_v4
 
     if args.live:
         config.DRY_RUN = False
@@ -41,7 +41,7 @@ def cmd_watch(args):
     if args.threshold:
         config.MATERIALITY_THRESHOLD = args.threshold
 
-    run_pipeline_v2()
+    run_pipeline_v4()
 
 
 def cmd_run(args):
@@ -143,7 +143,7 @@ def cmd_verify(args):
     """Check all API keys and connections work."""
     from rich.panel import Panel
 
-    console.print(Panel("[bold]KALSHI PIPELINE V2 — VERIFICATION[/bold]", style="bright_green"))
+    console.print(Panel("[bold]KALSHI PIPELINE V4 — VERIFICATION[/bold]", style="bright_green"))
     all_good = True
 
     # 1. Python version
@@ -252,7 +252,7 @@ def cmd_verify(args):
     # 11. SQLite
     try:
         import logger as _
-        console.print(f"  [bright_green]PASS[/bright_green]  SQLite database (V2 schema)")
+        console.print(f"  [bright_green]PASS[/bright_green]  SQLite database (V4 schema)")
     except Exception as e:
         console.print(f"  [red]FAIL[/red]  SQLite — {e}")
         all_good = False
@@ -263,7 +263,7 @@ def cmd_verify(args):
         console.print(Panel(
             "[bright_green bold]ALL CHECKS PASSED[/bright_green bold]\n\n"
             "You're ready to go. Run:\n"
-            "  python cli.py watch             # V2: Event-driven pipeline\n"
+            "  python cli.py watch             # V4: Event-driven pipeline\n"
             "  python cli.py run               # V1: Synchronous pipeline\n"
             "  python cli.py dashboard          # Live terminal dashboard\n"
             "  python cli.py backtest           # Validate strategy\n"
@@ -386,11 +386,11 @@ def cmd_stats(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kalshi Pipeline V2")
+    parser = argparse.ArgumentParser(description="Kalshi Pipeline V4")
     sub = parser.add_subparsers(dest="command")
 
-    # watch (V2)
-    p_watch = sub.add_parser("watch", help="V2: Event-driven pipeline (real-time)")
+    # watch (V4)
+    p_watch = sub.add_parser("watch", help="V4: Event-driven pipeline (real-time)")
     p_watch.add_argument("--live", action="store_true", help="Enable live trading")
     p_watch.add_argument("--threshold", type=float, default=None, help="Materiality threshold override")
     p_watch.set_defaults(func=cmd_watch)
@@ -409,7 +409,7 @@ def main():
     p_dash.set_defaults(func=cmd_dashboard)
 
     # backtest
-    p_bt = sub.add_parser("backtest", help="Backtest V2 strategy")
+    p_bt = sub.add_parser("backtest", help="Backtest V4 strategy")
     p_bt.add_argument("--limit", type=int, default=30, help="Number of resolved markets")
     p_bt.add_argument("--category", type=str, default=None, help="Filter by category")
     p_bt.set_defaults(func=cmd_backtest)

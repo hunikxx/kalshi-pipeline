@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Kalshi Pipeline — V1 (synchronous) and V2 (async event-driven).
+Kalshi Pipeline — V1 (synchronous) and V4 (async event-driven).
 V1: Scrape → Score → Edge → Trade (loop-based)
-V2: News stream → Match → Classify → Edge → Trade (event-driven)
+V4: News stream → Match → Classify → Edge → Trade (event-driven)
 """
 from __future__ import annotations
 
@@ -20,22 +20,23 @@ import logger
 from scraper import scrape_all
 from markets import Market, fetch_active_markets, filter_by_categories
 from scorer import score_market, filter_news_for_market
-from edge import detect_edge, detect_edge_v2, Signal
+from edge import detect_edge, detect_edge_v4, Signal
 from executor import execute_trade, execute_trade_async
 from news_stream import NewsAggregator, NewsEvent
 from market_watcher import MarketWatcher
-from matcher import match_news_to_markets
+from matcher import match_news_to_markets, match_news_to_markets_broad
 from classifier import classify_async
+from polymarket_tracker import PolymarketTracker
 
 console = Console()
 log = logging.getLogger(__name__)
 
 
 # ============================================================
-# V2: Event-Driven Pipeline
+# V4: Event-Driven Pipeline
 # ============================================================
 
-class PipelineV2:
+class PipelineV4:
     """Async event-driven pipeline. Runs indefinitely."""
 
     CLUSTER_WINDOW = 10.0  # seconds to buffer similar headlines
@@ -45,6 +46,7 @@ class PipelineV2:
         self.signal_queue: asyncio.Queue = asyncio.Queue()
         self.news_aggregator = NewsAggregator(self.news_queue)
         self.market_watcher = MarketWatcher()
+        self.poly_tracker = PolymarketTracker(min_trade_usd=20_000)
         self.running = False
         # Clustering buffer
         self._cluster_buffer: list[NewsEvent] = []
@@ -64,20 +66,22 @@ class PipelineV2:
     async def run(self):
         """Start all pipeline components concurrently."""
         self.running = True
+        # Connect signal queues so whale alerts can generate trades
+        self.market_watcher.signal_queue = asyncio.Queue()
+        self.poly_tracker.signal_queue = asyncio.Queue()
         mode = "[red bold]LIVE[/red bold]" if not config.DRY_RUN else "[yellow]DRY RUN[/yellow]"
-        console.print(Panel(f"Pipeline V2 Starting  |  Mode: {mode}", style="bright_green"))
-        console.print(f"  Niche filter: ${config.MIN_VOLUME_USD:,.0f} - ${config.MAX_VOLUME_USD:,.0f} volume")
-        console.print(f"  Materiality threshold: {config.MATERIALITY_THRESHOLD}")
-        console.print(f"  Speed target: {config.SPEED_TARGET_SECONDS}s")
+        console.print(Panel(f"Pipeline V4 Starting  |  Mode: {mode}", style="bright_green"))
+        console.print(f"  Kalshi trade feed: WebSocket → whale trades $5K+ → auto-trade")
+        console.print(f"  Polymarket whale tracker: $25K+ trades → match to Kalshi → auto-trade")
+        console.print(f"  Max bet: ${config.MAX_BET_USD} | Daily limit: ${config.DAILY_LOSS_LIMIT_USD}")
         console.print()
 
         try:
             await asyncio.gather(
-                self.news_aggregator.run(),
-                self.market_watcher.run(),
-                self._collect_news(),
-                self._flush_clusters(),
-                self._process_clusters(),
+                self.market_watcher.run(),           # Kalshi markets + WebSocket trade feed
+                self._process_flow_signals(),        # Kalshi whale trades → auto-trade
+                self._wait_then_start_poly(),        # Polymarket whale tracking → trade on Kalshi
+                self._process_poly_signals(),        # Polymarket whales → signals
                 self._execute_signals(),
                 self._status_printer(),
                 return_exceptions=True,
@@ -94,6 +98,9 @@ class PipelineV2:
         while True:
             event: NewsEvent = await self.news_queue.get()
             self.stats["news_processed"] += 1
+            console.print(
+                f"  [bright_blue]NEWS[/bright_blue] [{event.source}] {event.headline[:80]}"
+            )
             logger.log_news_event(
                 headline=event.headline,
                 source=event.source,
@@ -160,6 +167,12 @@ class PipelineV2:
 
     async def _process_clusters(self):
         """Consume clusters: match → classify → edge → queue signal."""
+        # Wait for markets to load before processing anything
+        while not self.market_watcher.tracked_markets:
+            console.print(f"  [dim]Waiting for markets to load before processing news...[/dim]")
+            await asyncio.sleep(3)
+        console.print(f"  [bright_green]Markets ready — {len(self.market_watcher.tracked_markets)} niche, {len(self.market_watcher.all_markets)} total. Processing news.[/bright_green]")
+
         while True:
             cluster: list[NewsEvent] = await self._cluster_queue.get()
             velocity = len(cluster)
@@ -178,20 +191,41 @@ class PipelineV2:
             else:
                 combined = primary.headline
 
-            # Match to markets
-            matched = match_news_to_markets(
+            # Match to markets (broad: keyword first, then category fallback)
+            n_tracked = len(self.market_watcher.tracked_markets)
+            matched = match_news_to_markets_broad(
                 primary.headline,
+                getattr(primary, 'summary', ''),
                 self.market_watcher.tracked_markets,
             )
             if not matched:
+                console.print(
+                    f"    [dim]→ no match (0/{n_tracked} markets) for: {primary.headline[:60]}[/dim]"
+                )
                 continue
 
             self.stats["markets_matched"] += len(matched)
+            console.print(
+                f"    [bright_yellow]MATCH[/bright_yellow] {len(matched)} market(s) for: {primary.headline[:60]}"
+            )
 
             for market in matched:
                 try:
                     classification = await classify_async(
                         combined, market, primary.source
+                    )
+
+                    # --- Diagnostic: show every classification result ---
+                    dir_color = {
+                        "bullish": "bright_green",
+                        "bearish": "red",
+                        "neutral": "dim",
+                    }.get(classification.direction, "dim")
+                    console.print(
+                        f"  [{dir_color}]CLASSIFY[/{dir_color}] "
+                        f"{classification.direction} mat:{classification.materiality:.2f} "
+                        f"\"{primary.headline[:50]}\" → \"{market.question[:40]}\" "
+                        f"({classification.latency_ms}ms)"
                     )
 
                     # --- Exit check: does this contradict an open position? ---
@@ -209,8 +243,23 @@ class PipelineV2:
                         )
                         continue
 
-                    signal = detect_edge_v2(market, classification, primary)
+                    signal = detect_edge_v4(market, classification, primary)
                     if not signal:
+                        # Show why it was rejected
+                        if classification.direction == "neutral":
+                            reason = "neutral"
+                        elif classification.materiality < config.MATERIALITY_THRESHOLD:
+                            reason = f"mat {classification.materiality:.2f} < {config.MATERIALITY_THRESHOLD}"
+                        elif classification.direction == "bullish" and market.yes_price > 0.85:
+                            reason = f"price too high ({market.yes_price:.2f})"
+                        elif classification.direction == "bearish" and market.yes_price < 0.15:
+                            reason = f"price too low ({market.yes_price:.2f})"
+                        else:
+                            edge = classification.materiality * (
+                                (1 - market.yes_price) if classification.direction == "bullish" else market.yes_price
+                            )
+                            reason = f"edge {edge:.3f} < {config.EDGE_THRESHOLD}"
+                        console.print(f"    [dim]→ rejected: {reason}[/dim]")
                         continue
 
                     # Apply velocity bonus
@@ -285,6 +334,141 @@ class PipelineV2:
             total_latency_ms=event.latency_ms + new_cls.latency_ms,
         )
 
+    async def _wait_then_start_poly(self):
+        """Wait for Kalshi markets to load, then start Polymarket tracker."""
+        while not self.market_watcher.all_markets:
+            await asyncio.sleep(2)
+        self.poly_tracker.kalshi_markets = self.market_watcher.all_markets
+        console.print(
+            f"  [bright_magenta]Polymarket tracker loaded with "
+            f"{len(self.poly_tracker.kalshi_markets)} Kalshi markets for matching[/bright_magenta]"
+        )
+        await self.poly_tracker.run()
+
+    async def _process_poly_signals(self):
+        """Convert Polymarket whale signals into Kalshi trades."""
+        poly_q = self.poly_tracker.signal_queue
+        if not poly_q:
+            return
+        while True:
+            sig = await poly_q.get()
+            if sig.get("type") not in ("poly_whale", "poly_exit"):
+                continue
+
+            market = sig["market"]
+            side = sig["side"]
+            score = sig["score"]
+            size = sig["size"]
+            pattern = sig.get("pattern", "")
+            wallet = sig.get("wallet_name", "?")
+
+            # Scale bet by score (50=min signal, 100=max)
+            bet_frac = min((score - 30) / 70.0, 1.0)
+            bet_amount = round(max(1.0, config.MAX_BET_USD * bet_frac), 2)
+            edge = min(score / 100.0 * 0.3, 0.30)
+
+            signal = Signal(
+                market=market,
+                claude_score=edge,
+                market_price=market.yes_price,
+                edge=edge,
+                side=side,
+                bet_amount=bet_amount,
+                reasoning=f"POLY WHALE: ${size:,.0f} {side} by {wallet} (score:{score}, {pattern or 'new'})",
+                headlines=f"Polymarket whale: {side} ${size:,.0f} @{sig.get('poly_price', 0):.2f}",
+                news_source="polymarket",
+                classification=f"poly_{side.lower()}",
+                materiality=score / 100.0,
+            )
+
+            self.stats["signals_found"] += 1
+            await self.signal_queue.put(signal)
+
+            console.print(
+                f"  [bright_magenta]POLY→KALSHI[/bright_magenta] "
+                f"{side} ${bet_amount} edge:{edge:.1%} "
+                f"whale:{wallet} ${size:,.0f} score:{score} "
+                f"→ \"{market.question[:40]}...\""
+            )
+
+    async def _process_flow_signals(self):
+        """Convert whale/flow alerts from market watcher into trade signals."""
+        flow_q = self.market_watcher.signal_queue
+        if not flow_q:
+            return
+        while True:
+            flow = await flow_q.get()
+            if flow.get("type") != "flow_signal":
+                continue
+
+            market = flow["market"]
+            side = flow["side"]
+            size = flow["size"]
+            price = flow["price"]
+            cluster_count = flow.get("cluster_count", 1)
+
+            # OI ratio for scaling (no minimum threshold)
+            oi = market.open_interest
+            if oi > 0:
+                oi_ratio = size / oi
+            else:
+                oi_ratio = 0.10  # assume moderate if no OI data
+
+            # --- Base edge from OI ratio ---
+            base_edge = 0.12
+            edge = min(base_edge * max(oi_ratio / 0.05, 1.0), 0.40)
+
+            # --- (1) Sweet spot pricing: lower price = more upside = bigger bet ---
+            # $0.20 → 1.5x, $0.40 → 1.25x, $0.60 → 1.0x, $0.80 → 0.75x
+            price_mult = max(0.75, min(1.5, (0.80 - price) / 0.60 + 0.75))
+
+            # --- (2) Whale clustering: multiple whales = stronger signal ---
+            cluster_mult = 1.0
+            if cluster_count >= 3:
+                cluster_mult = 2.0
+            elif cluster_count >= 2:
+                cluster_mult = 1.5
+
+            # --- Final bet calculation ---
+            bet_frac = min(oi_ratio / 0.25, 1.0)
+            bet_amount = config.MAX_BET_USD * bet_frac * price_mult * cluster_mult
+            bet_amount = round(max(1.0, min(bet_amount, config.MAX_BET_USD)), 2)
+
+            signal = Signal(
+                market=market,
+                claude_score=edge,
+                market_price=market.yes_price,
+                edge=edge,
+                side=side,
+                bet_amount=bet_amount,
+                reasoning=(
+                    f"WHALE FLOW: ${size:,.0f} {side} "
+                    f"(OI:{oi_ratio:.0%} price:{price_mult:.1f}x "
+                    f"cluster:{cluster_count})"
+                ),
+                headlines=f"Flow alert: {side} ${size:,.0f}@{price:.2f} OI:{oi:,.0f}",
+                news_source="flow",
+                classification=f"flow_{side.lower()}",
+                materiality=min(oi_ratio * 4, 1.0),
+            )
+
+            self.stats["signals_found"] += 1
+            await self.signal_queue.put(signal)
+
+            boosts = []
+            if price_mult > 1.1:
+                boosts.append(f"price:{price_mult:.1f}x")
+            if cluster_count > 1:
+                boosts.append(f"cluster:{cluster_count}x")
+            boost_str = f" [{' '.join(boosts)}]" if boosts else ""
+
+            console.print(
+                f"  [bright_magenta]WHALE SIGNAL[/bright_magenta] "
+                f"{side} ${bet_amount} edge:{edge:.1%} "
+                f"(${size:,.0f} = {oi_ratio:.0%} of OI){boost_str} "
+                f"on \"{market.question[:40]}...\""
+            )
+
     async def _execute_signals(self):
         """Execute trades from the signal queue."""
         while True:
@@ -292,36 +476,64 @@ class PipelineV2:
             result = await execute_trade_async(signal)
             self.stats["trades_executed"] += 1
 
-            status_color = "bright_green" if result["status"] in ("dry_run", "executed") else "red"
+            status = result["status"]
+            side = result["side"]
+            is_exit = "EXIT" in (signal.reasoning or "")
+            src = signal.news_source or "—"
+
+            if status == "executed":
+                status_str = "[bold bright_white on green] FILLED [/bold bright_white on green]"
+            elif status == "dry_run":
+                status_str = "[bold black on yellow] DRY RUN [/bold black on yellow]"
+            else:
+                status_str = f"[bold white on red] {status[:10].upper()} [/bold white on red]"
+
+            if is_exit:
+                action_str = "[bold white on red] SELL [/bold white on red]"
+            elif side == "YES":
+                action_str = "[bold white on green] BUY YES [/bold white on green]"
+            else:
+                action_str = "[bold white on magenta] BUY NO [/bold white on magenta]"
+
+            console.print()
             console.print(
-                f"  [{status_color}]{result['status']}[/{status_color}] "
-                f"{result['side']} ${result['amount']:.2f} "
-                f"on \"{result['market'][:40]}\" "
-                f"(edge:{result['edge']:.1%} latency:{result.get('latency_ms', 0)}ms)"
+                f"  {status_str} {action_str} "
+                f"[bold]${result['amount']:.2f}[/bold] "
+                f"on [bold]\"{result['market'][:45]}\"[/bold]"
             )
+            console.print(
+                f"    price: [bold]${signal.market_price:.2f}[/bold] | "
+                f"edge: [bold]{result['edge']:.1%}[/bold] | "
+                f"source: [bold]{src}[/bold] | "
+                f"{signal.reasoning[:60] if signal.reasoning else ''}"
+            )
+            console.print()
 
     async def _status_printer(self):
         """Print periodic status updates."""
         while True:
             await asyncio.sleep(30)
-            ns = self.news_aggregator.stats
+            ws = self.market_watcher.stats
+            ps = self.poly_tracker.stats
+            ws_status = "WS" if self.market_watcher._ws_connected else "HTTP"
             console.print(
-                f"\n  [dim]Status: "
-                f"news={self.stats['news_processed']} "
-                f"(tw:{ns.get('twitter', 0)} tg:{ns.get('telegram', 0)} rss:{ns.get('rss', 0)}) "
-                f"clusters={self.stats['clusters_formed']} "
-                f"matched={self.stats['markets_matched']} "
-                f"signals={self.stats['signals_found']} "
-                f"exits={self.stats['exits_triggered']} "
-                f"trades={self.stats['trades_executed']} "
-                f"positions={len(self._open_positions)} "
-                f"markets={len(self.market_watcher.tracked_markets)}[/dim]\n"
+                f"\n  [bright_magenta]STATUS:[/bright_magenta] "
+                f"kalshi={len(self.market_watcher.all_markets)} "
+                f"feed={ws_status} "
+                f"ws_trades={ws['ws_trades']} "
+                f"http_trades={ws['http_trades']} "
+                f"whales={ws['whales_detected']} "
+                f"| poly_polls={ps.get('polls', 0)} "
+                f"poly_whales={ps.get('whales_detected', 0)} "
+                f"matched={ps.get('kalshi_matches', 0)} "
+                f"| signals={self.stats['signals_found']} "
+                f"trades={self.stats['trades_executed']}\n"
             )
 
 
-def run_pipeline_v2():
-    """Entry point for V2 event-driven pipeline."""
-    pipeline = PipelineV2()
+def run_pipeline_v4():
+    """Entry point for V4 event-driven pipeline."""
+    pipeline = PipelineV4()
     try:
         asyncio.run(pipeline.run())
     except KeyboardInterrupt:

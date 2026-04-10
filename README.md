@@ -1,19 +1,23 @@
-# Kalshi Pipeline V4
+# Kalshi Pipeline V5
 
-An AI-powered breaking news detector that classifies events against Kalshi prediction markets and trades automatically when it finds edge.
+A whale-following prediction market bot that tracks large trades on both Polymarket and Kalshi, then auto-trades on Kalshi.
 
 ```
-Breaking News (Twitter / Telegram / RSS)
-        ↓ cluster similar headlines (10s window)
-Match to niche markets (< $500K volume)
-        ↓
-Claude Classification: bullish / bearish / neutral + materiality + confidence
-        ↓
-Edge = materiality × confidence × source_weight × time_decay × price_room
-        ↓
-Adaptive Kelly sizing → duplicate/correlation guard → execute
-        ↓
-SQLite log → calibration tracking → exit on contradicting news
+Kalshi WebSocket Trade Feed (real-time)
+        ↓ detect $10K+ whale trades
+        ↓ fetch unknown markets on-the-fly
+        ↓ price filter ($0.05–$0.85)
+        ↓ OI-weighted bet sizing + sweet spot pricing + whale clustering
+        ↓ auto-trade on Kalshi
+
+Polymarket Public API (5s polling)
+        ↓ detect $20K+ whale trades (politics + crypto)
+        ↓ track wallets — patterns: doubling down, flip, hedge, repeat
+        ↓ score 0–100 → threshold 35+ to trade
+        ↓ keyword match to Kalshi market (45%+ Jaccard)
+        ↓ auto-trade on Kalshi
+
+Both → SQLite log → dashboard → exit on whale reversal or +8¢ price target
 ```
 
 ## Version History
@@ -37,43 +41,35 @@ V2 had critical bugs that would bite in 24/7 operation. V3 fixes them:
 - **Graceful shutdown**: Named `asyncio.Task`s, proper SIGINT/SIGTERM handlers, awaited cleanup
 - **Circuit breaker**: Pauses classification for 60s after 10 consecutive failures, prevents cascade
 
-### V3 → V4: Smarter Edge + Revenue Optimization
+### V4 → V5: Whale Following
 
-V3 was reliable but left money on the table. V4 makes the core algorithm significantly smarter:
+V4 relied on news classification with Claude. V5 pivots to a pure whale-following strategy with zero LLM cost:
 
-**Better signal quality:**
-- **Matcher minimum threshold**: Requires 2+ keyword hits AND 15% relevance score — eliminates single-keyword false positives (e.g. "OpenAI" alone no longer matches every AI market)
-- **Enriched classification prompt**: Claude now sees market end date, time remaining, volume, and source reliability tier — can judge "already priced in" vs "fresh news"
-- **Confidence output**: Claude rates its own certainty (0-1). Low-confidence classifications (< 0.4) are rejected entirely
+**Dual-source whale tracking:**
+- **Kalshi WebSocket**: Real-time trade feed via `trade` channel — every executed trade streamed instantly
+- **Polymarket polling**: Public API polled every 5s for $20K+ trades in politics + crypto sectors
+- **On-the-fly market fetch**: Unknown tickers are fetched from Kalshi API and cached — never misses a whale
 
-**Smarter edge formula:**
-- **Old**: `edge = materiality × price_room`
-- **New**: `edge = materiality × confidence × source_weight × time_decay × price_room`
-- **Source weighting**: Reuters/Bloomberg = 1.0×, TechCrunch/RSS = 0.75×, Twitter/Telegram = 0.5×
-- **Time decay**: Markets closing in < 1 day get 1.2× (news is very actionable), 30+ days get 0.5× (will be priced in)
+**Wallet intelligence (Polymarket):**
+- Tracks wallet addresses (SHA-256 hashed) with full trade history
+- Detects patterns: doubling_down, flip, hedge, heavy_actor, repeat_whale
+- Scores alerts 0–100 based on trade size, wallet history, pattern, price extremity
+- Score 35+ triggers auto-trade on matched Kalshi market
 
-**Adaptive position sizing:**
-- Kelly multiplier scales with calibration accuracy: 0.05× at < 45% (canary), up to 0.5× at 75%+ (proven edge)
-- Removed arbitrary `bankroll = daily_limit × 10` — bankroll is now just `DAILY_LOSS_LIMIT`
+**Cross-platform matching:**
+- Keyword Jaccard similarity (45% threshold) matches Polymarket titles to Kalshi markets
+- Stopword filtering for accurate matching
+- 5-minute cooldown per market prevents duplicate trades
 
-**News velocity clustering:**
-- Headlines buffered in 10s windows, grouped by token-overlap fingerprint
-- 3 tweets about "Fed cuts rates" → 1 classification with "[3 reports from: twitter, rss, telegram]"
-- Velocity multiplier: 2 sources = 1.15× edge, 3+ sources = 1.3× edge
+**Smart bet sizing:**
+- **Open interest weighting**: Whale trade as % of market OI scales the bet
+- **Sweet spot pricing**: Lower-priced contracts (more upside) get up to 1.5x bet multiplier
+- **Whale clustering**: 2+ whales on same market in 10 min = 1.5–2x bet boost
+- Price filter: only trade contracts between $0.05–$0.85
 
 **Exit strategy:**
-- Pipeline tracks open positions
-- Contradicting news (long YES + new bearish with materiality above threshold) triggers an EXIT signal
-- Exit flips the side and matches entry size
-
-**Duplicate trade prevention:**
-- Same `(headline, market)` pair won't re-fire within 5-minute cooldown
-- Bounded to 1K entries with FIFO eviction
-
-**Kalshi migration:**
-- Full migration from Polymarket to Kalshi API (RSA-PSS auth, REST + WebSocket)
-- Contract-based order sizing, limit orders via `POST /portfolio/orders`
-- Demo mode support (`KALSHI_DEMO=true`)
+- Whale reversal: same wallet flips to opposite side → sell
+- Price target: +8 cent move in our favor → sell
 
 ---
 
@@ -174,20 +170,15 @@ python cli.py backtest --limit 50 --category ai
 
 ## Architecture
 
-### V4 Pipeline (Event-Driven)
+### V5 Pipeline (Whale Following)
 
 ```
-news_stream.py      Real-time news — Twitter API v2, Telegram, RSS fallback
-pipeline.py         Event-driven orchestrator — clustering, exit strategy, velocity (asyncio)
-matcher.py          Routes breaking news to relevant markets (min 2-keyword threshold)
-classifier.py       Claude classification — direction + materiality + confidence + source tier
-edge.py             Composite edge — source weight × confidence × time decay × price room
-                    Adaptive Kelly sizing from calibration accuracy
-executor.py         Trade execution — dry-run + live Kalshi orders (async)
-market_watcher.py   Kalshi WebSocket + REST — live prices, niche filter, momentum
-kalshi_auth.py      RSA-PSS request signing for Kalshi API
-calibrator.py       Tracks classification accuracy over time
-backtest.py         Historical replay for strategy validation
+market_watcher.py      Kalshi WebSocket trade feed + HTTP fallback — real-time whale detection
+polymarket_tracker.py  Polymarket $20K+ whale tracking — wallet profiling, pattern detection
+pipeline.py            Orchestrator — dual whale feeds → signal scoring → auto-trade (asyncio)
+markets.py             Kalshi market loading via /events API + on-the-fly ticker fetch
+executor.py            Trade execution — dry-run + live Kalshi orders (async)
+kalshi_auth.py         RSA-PSS request signing for Kalshi API
 ```
 
 ### Shared Infrastructure
@@ -203,36 +194,30 @@ cli.py              CLI — watch, run, backtest, calibrate, niche, verify, etc.
 
 ## How It Actually Works
 
-### 1. News Detection
-Real-time streams from Twitter (filtered by keywords: OpenAI, Bitcoin, Fed rate, etc.), Telegram channels, and RSS fallback. Events are deduplicated and timestamped with receive latency.
+### 1. Kalshi Trade Feed
+WebSocket connects to `wss://api.elections.kalshi.com/trade-api/ws/v2` and subscribes to the `trade` channel. Every executed trade on Kalshi streams in real-time. HTTP polling (`/markets/trades`) activates as fallback if WebSocket drops.
 
-### 2. News Clustering (V4)
-Headlines are buffered in 10-second windows. Similar headlines are grouped by token-overlap fingerprint — so "Fed cuts rates by 50bp" and "Federal Reserve cuts interest rates" become one cluster. The best headline (lowest latency, highest-tier source) represents the cluster. Multi-source clusters get a velocity multiplier.
+### 2. Polymarket Whale Detection
+Public API polled every 5 seconds for trades $20K+ in politics and crypto sectors. Each trade's wallet address is tracked — the system builds a profile of repeat whales and detects behavioral patterns (doubling down, flipping, hedging).
 
-### 3. Market Matching
-Each headline is matched to active niche markets (<$500K volume) by keyword overlap. Requires at least 2 keyword hits and a 15% relevance score to prevent false positives. Only relevant markets proceed to classification.
+### 3. Kalshi Whale Detection
+Trades $10K+ trigger auto-trade signals. Unknown market tickers are fetched on-the-fly from the Kalshi API and cached. Contracts priced below $0.05 or above $0.85 are filtered out.
 
-### 4. Classification
-Instead of "what's the probability?", Claude is asked: *"Does this news make the market MORE likely to resolve YES, MORE likely to resolve NO, or is it NOT RELEVANT?"*
+### 4. Cross-Platform Matching
+Polymarket whale trades are matched to Kalshi markets by keyword Jaccard similarity (45% threshold). Stopwords are removed before comparison. Matched trades are scored 0–100 — score 35+ triggers a trade.
 
-Claude sees the full market context: current price, end date, time remaining, volume, and source reliability tier. It returns direction, materiality (0-1), and confidence (0-1).
+### 5. Bet Sizing
+Bet amount ($1–$10) is calculated from multiple factors:
+- **OI ratio**: whale trade as percentage of market open interest
+- **Sweet spot pricing**: lower-priced contracts (more upside) get up to 1.5x multiplier
+- **Whale clustering**: multiple whales on same market in 10 min = 1.5–2x boost
 
-### 5. Edge Detection (V4)
-Edge is a composite score: `materiality × confidence × source_weight × time_decay × price_room`.
-
-- Source weight: Reuters = 1.0×, RSS = 0.75×, Twitter = 0.5×
-- Time decay: expiring markets (< 1 day) get 1.2×, long-horizon (30+ days) get 0.5×
-- Velocity bonus: 2 corroborating sources = 1.15×, 3+ = 1.3×
-- Position sizing uses adaptive Kelly — multiplier scales from 0.05× to 0.5× based on proven calibration accuracy
-
-### 6. Exit Strategy (V4)
-The pipeline tracks open positions. When contradicting news arrives (e.g., long YES on a market, then strong bearish news), an exit signal fires — flips the side and matches the entry size.
+### 6. Exit Strategy
+- **Whale reversal**: same Polymarket wallet flips to opposite side → sell
+- **Price target**: +8 cent move in our favor → sell
 
 ### 7. Execution
-Dry-run by default. Live mode places limit orders via the Kalshi API. Safety: $25 max bet, $100 daily limit. Duplicate trade prevention blocks the same headline×market pair from firing within 5 minutes.
-
-### 8. Calibration
-Every trade is tracked. As markets resolve, the system measures whether its classifications were correct. Accuracy feeds back into adaptive Kelly sizing — proven accuracy means larger bets.
+Dry-run by default. Live mode places orders via Kalshi API. Safety: $10 max bet, $100 daily limit. 5-minute cooldown per market prevents duplicate trades.
 
 ---
 
@@ -241,29 +226,27 @@ Every trade is tracked. As markets resolve, the system measures whether its clas
 | Setting | Default | What it does |
 |---|---|---|
 | `DRY_RUN` | `true` | Set to `false` for live trading |
-| `MAX_BET_USD` | `25` | Maximum single bet |
+| `MAX_BET_USD` | `10` | Maximum single bet |
 | `DAILY_LOSS_LIMIT_USD` | `100` | Pipeline halts if breached |
-| `EDGE_THRESHOLD` | `0.10` | Minimum edge to trigger trade |
-| `MAX_VOLUME_USD` | `500000` | Only trade markets below this volume |
-| `MIN_VOLUME_USD` | `1000` | Skip dead markets |
-| `MATERIALITY_THRESHOLD` | `0.6` | Minimum materiality to act on |
-| `SPEED_TARGET_SECONDS` | `5` | Target news-to-trade latency |
+| `KALSHI_WHALE_USD` | `10000` | Kalshi trade size to auto-trade |
+| `POLY_WHALE_USD` | `20000` | Polymarket trade size to track |
+| `POLY_SCORE_MIN` | `35` | Minimum Polymarket whale score to trade |
+| `POLY_MATCH_PCT` | `45%` | Keyword match threshold for cross-platform |
+| `PRICE_FILTER` | `$0.05–$0.85` | Only trade contracts in this range |
 
 ---
 
 ## Safety
 
 - Dry-run mode ON by default
-- $25 max single bet, $100 daily limit
-- Adaptive Kelly sizing — shrinks bets when accuracy is unproven, grows when calibrated
-- Circuit breaker — pauses classification after 10 consecutive failures (60s cooldown)
-- Duplicate trade prevention — same headline×market can't fire within 5 minutes
-- Confidence gate — low-confidence classifications (< 0.4) are rejected
-- Source discounting — unverified Twitter/Telegram rumors get 0.5× weight
-- Exit strategy — contradicting news triggers position exit
-- Niche market filter prevents competing against sophisticated bots
-- Graceful shutdown — SIGINT/SIGTERM properly cancels all tasks
+- $10 max single bet, $100 daily limit
+- Price filter: only trade contracts $0.05–$0.85
+- Duplicate trade prevention — 5-minute cooldown per market
+- Exit strategy — whale reversal + price target (+8¢)
+- Trade deduplication by trade_id (WebSocket) and tx_hash (Polymarket)
+- Wallet addresses SHA-256 hashed, never stored in plaintext
 - All API keys in `.env`, never committed
+- Zero LLM cost — no Claude API calls in V5
 
 ---
 

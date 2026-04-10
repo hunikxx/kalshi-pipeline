@@ -8,6 +8,9 @@ import httpx
 
 import config
 from kalshi_auth import auth_headers
+from rich.console import Console
+
+_console = Console()
 
 
 @dataclass
@@ -23,6 +26,7 @@ class Market:
     tokens: list[dict]  # kept for compatibility — [{token_id, outcome, price}]
     event_ticker: str = ""
     liquidity: float = 0.0
+    open_interest: float = 0.0
 
     @property
     def implied_probability(self) -> float:
@@ -35,87 +39,117 @@ def _api_path(endpoint: str) -> str:
     return parsed.path
 
 
-def fetch_active_markets(limit: int = 50) -> list[Market]:
-    """Fetch active markets from Kalshi API."""
+def fetch_active_markets(limit: int = 500) -> list[Market]:
+    """Fetch active markets from Kalshi API via the events endpoint."""
+    import time as _time
     markets = []
     cursor = None
+    max_pages = 20
 
-    while len(markets) < limit:
+    for page in range(max_pages):
+        endpoint = "/events"
+        path = _api_path(endpoint)
+        headers = auth_headers("GET", path)
+
         params: dict = {
             "status": "open",
-            "limit": min(limit - len(markets), 200),
+            "limit": 50,
+            "with_nested_markets": "true",
         }
         if cursor:
             params["cursor"] = cursor
 
-        endpoint = "/markets"
-        path = _api_path(endpoint)
-        headers = auth_headers("GET", path)
-
-        try:
-            resp = httpx.get(
-                f"{config.KALSHI_HOST}{endpoint}",
-                params=params,
-                headers=headers,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"[markets] Kalshi API error: {e}")
-            return markets
-
-        for m in data.get("markets", []):
+        for attempt in range(3):
             try:
-                yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
-                yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
-                no_bid = float(m.get("no_bid_dollars", 0) or 0)
-                no_ask = float(m.get("no_ask_dollars", 0) or 0)
+                resp = httpx.get(
+                    f"{config.KALSHI_HOST}{endpoint}",
+                    params=params,
+                    headers=headers,
+                    timeout=30,
+                )
+                if resp.status_code == 429:
+                    _console.print(f"  [yellow][markets][/yellow] Rate limited, waiting 10s...")
+                    _time.sleep(10)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                events = data.get("events", [])
+                _console.print(f"  [dim][markets][/dim] Page {page+1}: {len(events)} events (status {resp.status_code})")
+                break
+            except Exception as e:
+                _console.print(f"  [red][markets][/red] API error (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    _time.sleep(3)
+                else:
+                    _finish_log(markets)
+                    return markets
 
-                # Mid price, or last trade price
-                last_price = float(m.get("last_price_dollars", 0) or 0)
-                yes_price = last_price if last_price > 0 else (yes_bid + yes_ask) / 2 if (yes_bid + yes_ask) > 0 else 0.5
-                no_price = 1.0 - yes_price
+        # Pause between paginated requests
+        if page > 0:
+            _time.sleep(0.5)
 
-                vol_24h = float(m.get("volume_24h_fp", 0) or 0)
-                vol_total = float(m.get("volume_fp", 0) or 0)
-                liquidity = float(m.get("liquidity_dollars", 0) or 0)
+        # Extract nested markets from each event
+        for event in events:
+            event_category = event.get("category", "")
+            for m in event.get("markets", []):
+                try:
+                    ticker = m.get("ticker", "")
+                    status = m.get("status", "")
 
-                ticker = m.get("ticker", "")
-                title = m.get("title", m.get("yes_sub_title", ticker))
-                status = m.get("status", "")
+                    if status not in ("open", "active"):
+                        continue
 
-                if status != "open":
+                    # Skip multi-leg combo markets
+                    if any(prefix in ticker for prefix in ("KXMVE", "KXMULTI", "CROSSCATEGORY")):
+                        continue
+
+                    last_price = float(m.get("last_price_dollars", 0) or 0)
+                    yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
+                    yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
+                    yes_price = last_price if last_price > 0 else (yes_bid + yes_ask) / 2 if (yes_bid + yes_ask) > 0 else 0.5
+                    no_price = 1.0 - yes_price
+
+                    vol_24h = float(m.get("volume_24h_fp", 0) or 0)
+                    vol_total = float(m.get("volume_fp", 0) or 0)
+                    liquidity = float(m.get("liquidity_dollars", 0) or 0)
+                    open_interest = float(m.get("open_interest", 0) or 0)
+
+                    title = m.get("title", m.get("yes_sub_title", ticker))
+
+                    token_list = [
+                        {"token_id": ticker, "outcome": "Yes", "price": yes_price},
+                        {"token_id": ticker, "outcome": "No", "price": no_price},
+                    ]
+
+                    markets.append(Market(
+                        condition_id=ticker,
+                        question=title,
+                        category=_infer_category(title, event_category),
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        volume=vol_24h if vol_24h > 0 else vol_total,
+                        end_date=m.get("close_time", m.get("latest_expiration_time", "")),
+                        active=True,
+                        tokens=token_list,
+                        event_ticker=m.get("event_ticker", event.get("event_ticker", "")),
+                        liquidity=liquidity,
+                        open_interest=open_interest,
+                    ))
+                except (KeyError, ValueError, TypeError):
                     continue
 
-                # Build token-like structure for compatibility
-                token_list = [
-                    {"token_id": ticker, "outcome": "Yes", "price": yes_price},
-                    {"token_id": ticker, "outcome": "No", "price": no_price},
-                ]
-
-                markets.append(Market(
-                    condition_id=ticker,
-                    question=title,
-                    category=_infer_category(title, m.get("category", "")),
-                    yes_price=yes_price,
-                    no_price=no_price,
-                    volume=vol_24h if vol_24h > 0 else vol_total,
-                    end_date=m.get("close_time", m.get("latest_expiration_time", "")),
-                    active=True,
-                    tokens=token_list,
-                    event_ticker=m.get("event_ticker", ""),
-                    liquidity=liquidity,
-                ))
-            except (KeyError, ValueError, TypeError):
-                continue
-
         cursor = data.get("cursor")
-        if not cursor:
+        if not cursor or len(markets) >= limit:
             break
 
     markets.sort(key=lambda x: x.volume, reverse=True)
-    return markets
+    _finish_log(markets)
+    return markets[:limit]
+
+
+def _finish_log(markets: list[Market]):
+    categories = set(m.category for m in markets)
+    _console.print(f"  [bright_green][markets][/bright_green] Total parsed: {len(markets)} | Categories: {categories}")
 
 
 def fetch_market_by_ticker(ticker: str) -> Market | None:
@@ -156,11 +190,12 @@ def fetch_market_by_ticker(ticker: str) -> Market | None:
         ],
         event_ticker=m.get("event_ticker", ""),
         liquidity=float(m.get("liquidity_dollars", 0) or 0),
+        open_interest=float(m.get("open_interest", 0) or 0),
     )
 
 
 def fetch_orderbook(ticker: str) -> dict:
-    """Fetch order book for a market. Returns {yes_bids, yes_asks, no_bids, no_asks}."""
+    """Fetch order book for a market. Returns {yes: [[price, size], ...], no: [...]}."""
     endpoint = f"/markets/{ticker}/orderbook"
     path = _api_path(endpoint)
     headers = auth_headers("GET", path)
@@ -172,7 +207,14 @@ def fetch_orderbook(ticker: str) -> dict:
             timeout=10,
         )
         resp.raise_for_status()
-        return resp.json().get("orderbook", {})
+        data = resp.json()
+
+        # Kalshi returns orderbook_fp with yes_dollars / no_dollars
+        book = data.get("orderbook_fp") or data.get("orderbook", {})
+        return {
+            "yes": book.get("yes_dollars", book.get("yes", [])),
+            "no": book.get("no_dollars", book.get("no", [])),
+        }
     except Exception:
         return {}
 
@@ -193,7 +235,7 @@ def _infer_category(title: str, kalshi_category: str) -> str:
         return "technology"
     if any(kw in combined for kw in ["econ", "gdp", "inflation", "fed", "interest rate", "cpi", "jobs", "unemployment"]):
         return "economy"
-    if any(kw in combined for kw in ["weather", "hurricane", "temperature", "storm"]):
+    if any(kw in combined for kw in ["weather", "hurricane", "temperature", "storm", "tornado", "flood"]):
         return "weather"
     return kalshi_category if kalshi_category else "other"
 

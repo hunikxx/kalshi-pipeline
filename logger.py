@@ -31,7 +31,7 @@ def init_db():
             reasoning TEXT,
             headlines TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            -- V2 columns
+            -- V4 columns
             news_source TEXT,
             classification TEXT,
             materiality REAL,
@@ -70,6 +70,19 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS flow_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            market_question TEXT NOT NULL,
+            side TEXT NOT NULL,
+            size REAL NOT NULL,
+            price REAL NOT NULL,
+            avg_size REAL NOT NULL,
+            multiple REAL NOT NULL,
+            market_price REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS calibration (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trade_id INTEGER REFERENCES trades(id),
@@ -83,13 +96,13 @@ def init_db():
             UNIQUE(trade_id)
         );
     """)
-    # Add V2 columns to existing trades table if missing
-    _migrate_v2_columns(conn)
+    # Add V4 columns to existing trades table if missing
+    _migrate_v4_columns(conn)
     conn.close()
 
 
-def _migrate_v2_columns(conn):
-    """Add V2 columns to trades table if they don't exist."""
+def _migrate_v4_columns(conn):
+    """Add V4 columns to trades table if they don't exist."""
     cursor = conn.execute("PRAGMA table_info(trades)")
     columns = {row[1] for row in cursor.fetchall()}
     new_cols = [
@@ -189,6 +202,38 @@ def log_calibration(
     conn.close()
 
 
+def log_flow_alert(
+    ticker: str,
+    market_question: str,
+    side: str,
+    size: float,
+    price: float,
+    avg_size: float,
+    multiple: float,
+    market_price: float,
+) -> int:
+    conn = _conn()
+    cur = conn.execute(
+        """INSERT INTO flow_alerts
+           (ticker, market_question, side, size, price, avg_size, multiple, market_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (ticker, market_question, side, size, price, avg_size, multiple, market_price),
+    )
+    alert_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return alert_id
+
+
+def get_recent_flow_alerts(limit: int = 20) -> list[dict]:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM flow_alerts ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def log_run_start() -> int:
     conn = _conn()
     now = datetime.now(timezone.utc).isoformat()
@@ -252,10 +297,14 @@ def get_trade_stats() -> dict:
     by_status = conn.execute(
         "SELECT status, COUNT(*) as c FROM trades GROUP BY status"
     ).fetchall()
+    total_wagered = conn.execute(
+        "SELECT COALESCE(SUM(amount_usd), 0) as s FROM trades WHERE status IN ('executed', 'filled')"
+    ).fetchone()["s"]
     conn.close()
     return {
         "total_trades": total,
         "by_status": {r["status"]: r["c"] for r in by_status},
+        "total_wagered": total_wagered,
     }
 
 
