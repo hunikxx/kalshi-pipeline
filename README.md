@@ -4,20 +4,21 @@ A whale-following prediction market bot that tracks large trades on both Polymar
 
 ```
 Kalshi WebSocket Trade Feed (real-time)
-        ↓ detect $10K+ whale trades
+        ↓ detect $15K+ whale trades ($25K for sports)
         ↓ fetch unknown markets on-the-fly
         ↓ price filter ($0.05–$0.85)
         ↓ OI-weighted bet sizing + sweet spot pricing + whale clustering
+        ↓ try at whale price, bump +1¢/+2¢/+3¢ if not filled, cancel if still unfilled
         ↓ auto-trade on Kalshi
 
 Polymarket Public API (5s polling)
         ↓ detect $20K+ whale trades (politics + crypto)
         ↓ track wallets — patterns: doubling down, flip, hedge, repeat
-        ↓ score 0–100 → threshold 35+ to trade
+        ↓ score 0–100 → threshold 30+ to trade
         ↓ keyword match to Kalshi market (45%+ Jaccard)
         ↓ auto-trade on Kalshi
 
-Both → SQLite log → dashboard → exit on whale reversal or +8¢ price target
+Both → SQLite log → live dashboard (P/L from Kalshi API) → exit on whale reversal or +25¢ price target
 ```
 
 ## Version History
@@ -54,7 +55,7 @@ V4 relied on news classification with Claude. V5 pivots to a pure whale-followin
 - Tracks wallet addresses (SHA-256 hashed) with full trade history
 - Detects patterns: doubling_down, flip, hedge, heavy_actor, repeat_whale
 - Scores alerts 0–100 based on trade size, wallet history, pattern, price extremity
-- Score 35+ triggers auto-trade on matched Kalshi market
+- Score 30+ triggers auto-trade on matched Kalshi market
 
 **Cross-platform matching:**
 - Keyword Jaccard similarity (45% threshold) matches Polymarket titles to Kalshi markets
@@ -67,9 +68,20 @@ V4 relied on news classification with Claude. V5 pivots to a pure whale-followin
 - **Whale clustering**: 2+ whales on same market in 10 min = 1.5–2x bet boost
 - Price filter: only trade contracts between $0.05–$0.85
 
+**Order execution:**
+- Try at whale's price +1¢, bump to +2¢ then +3¢ if not filled (10s per attempt)
+- Auto-cancel unfilled orders after all attempts
+- Sports markets require $25K+ whale (higher noise threshold)
+
 **Exit strategy:**
 - Whale reversal: same wallet flips to opposite side → sell
-- Price target: +8 cent move in our favor → sell
+- Price target: +25¢ move in our favor → sell
+- Startup holdings check: auto-sell positions above threshold on restart
+
+**Live dashboard:**
+- Real-time P/L from Kalshi portfolio API (cached 30s)
+- Balance, unrealized P/L, realized P/L, total value
+- Timestamped trade log with fill status (FILLED/CANCELLED/DRY RUN)
 
 ---
 
@@ -201,7 +213,7 @@ WebSocket connects to `wss://api.elections.kalshi.com/trade-api/ws/v2` and subsc
 Public API polled every 5 seconds for trades $20K+ in politics and crypto sectors. Each trade's wallet address is tracked — the system builds a profile of repeat whales and detects behavioral patterns (doubling down, flipping, hedging).
 
 ### 3. Kalshi Whale Detection
-Trades $10K+ trigger auto-trade signals. Unknown market tickers are fetched on-the-fly from the Kalshi API and cached. Contracts priced below $0.05 or above $0.85 are filtered out.
+Trades $15K+ trigger auto-trade signals ($25K for sports markets). Unknown market tickers are fetched on-the-fly from the Kalshi API and cached. Contracts priced below $0.05 or above $0.85 are filtered out.
 
 ### 4. Cross-Platform Matching
 Polymarket whale trades are matched to Kalshi markets by keyword Jaccard similarity (45% threshold). Stopwords are removed before comparison. Matched trades are scored 0–100 — score 35+ triggers a trade.
@@ -212,12 +224,13 @@ Bet amount ($1–$10) is calculated from multiple factors:
 - **Sweet spot pricing**: lower-priced contracts (more upside) get up to 1.5x multiplier
 - **Whale clustering**: multiple whales on same market in 10 min = 1.5–2x boost
 
-### 6. Exit Strategy
-- **Whale reversal**: same Polymarket wallet flips to opposite side → sell
-- **Price target**: +8 cent move in our favor → sell
+### 6. Order Execution
+Orders try at whale price +1¢. If not filled in 10s, bumps to +2¢, then +3¢. Auto-cancels after all attempts. Dry-run by default. Safety: $10 max bet, $100 daily limit. 5-minute cooldown per market.
 
-### 7. Execution
-Dry-run by default. Live mode places orders via Kalshi API. Safety: $10 max bet, $100 daily limit. 5-minute cooldown per market prevents duplicate trades.
+### 7. Exit Strategy
+- **Whale reversal**: same Polymarket wallet flips to opposite side → sell
+- **Price target**: +25¢ move in our favor → sell
+- **Startup check**: scans existing holdings on restart, sells any above threshold
 
 ---
 
@@ -228,11 +241,12 @@ Dry-run by default. Live mode places orders via Kalshi API. Safety: $10 max bet,
 | `DRY_RUN` | `true` | Set to `false` for live trading |
 | `MAX_BET_USD` | `10` | Maximum single bet |
 | `DAILY_LOSS_LIMIT_USD` | `100` | Pipeline halts if breached |
-| `KALSHI_WHALE_USD` | `10000` | Kalshi trade size to auto-trade |
+| `KALSHI_WHALE_USD` | `15000` | Kalshi trade size to auto-trade ($25K sports) |
 | `POLY_WHALE_USD` | `20000` | Polymarket trade size to track |
-| `POLY_SCORE_MIN` | `35` | Minimum Polymarket whale score to trade |
+| `POLY_SCORE_MIN` | `30` | Minimum Polymarket whale score to trade |
 | `POLY_MATCH_PCT` | `45%` | Keyword match threshold for cross-platform |
 | `PRICE_FILTER` | `$0.05–$0.85` | Only trade contracts in this range |
+| `PRICE_TARGET` | `$0.25` | Sell when up 25¢ per contract |
 
 ---
 

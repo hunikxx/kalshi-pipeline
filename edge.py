@@ -25,6 +25,7 @@ class Signal:
     news_latency_ms: int = 0
     classification_latency_ms: int = 0
     total_latency_ms: int = 0
+    limit_price: float = 0.0  # whale price + 1¢ (0 = use market price)
 
 
 def detect_edge(

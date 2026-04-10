@@ -138,7 +138,7 @@ class PolymarketTracker:
         self._signal_cooldown = 300  # 5 min cooldown per market
         # Exit strategy
         self.open_positions: dict[str, OpenPosition] = {}  # kalshi ticker → position
-        self._price_target_cents = 0.08  # exit when price moves 8 cents in our favor
+        self._price_target_cents = 0.25  # exit when price moves 25 cents in our favor
         self.stats = {
             "polls": 0,
             "trades_seen": 0,
@@ -530,7 +530,7 @@ class PolymarketTracker:
                             f"(YES:{kalshi_market.yes_price:.2f})"
                         )
 
-                        if self.signal_queue and score >= 35:
+                        if self.signal_queue and score >= 30:
                             # Cooldown: one signal per market per 5 min
                             now = time.time()
                             last = self._recent_signals.get(kalshi_market.condition_id, 0)

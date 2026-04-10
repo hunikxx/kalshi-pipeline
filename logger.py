@@ -308,6 +308,83 @@ def get_trade_stats() -> dict:
     }
 
 
+_pnl_cache = {"data": None, "ts": 0}
+
+def get_portfolio_pnl() -> dict:
+    """Fetch live P/L from Kalshi portfolio API. Cached for 30s."""
+    import time
+    now = time.time()
+    if _pnl_cache["data"] and now - _pnl_cache["ts"] < 30:
+        return _pnl_cache["data"]
+    try:
+        import httpx
+        import config
+        from kalshi_auth import sign_request
+        from urllib.parse import urlparse
+
+        # Get balance
+        bal_endpoint = "/portfolio/balance"
+        bal_path = urlparse(f"{config.KALSHI_HOST}{bal_endpoint}").path
+        bal_headers = sign_request("GET", bal_path)
+        bal_resp = httpx.get(f"{config.KALSHI_HOST}{bal_endpoint}", headers=bal_headers, timeout=10)
+        bal_resp.raise_for_status()
+        balance = bal_resp.json()
+
+        available = float(balance.get("balance", 0)) / 100.0  # cents to dollars
+        payout = float(balance.get("payout", 0)) / 100.0
+
+        # Get positions
+        pos_endpoint = "/portfolio/positions"
+        pos_path = urlparse(f"{config.KALSHI_HOST}{pos_endpoint}").path
+        pos_headers = sign_request("GET", pos_path)
+        pos_resp = httpx.get(f"{config.KALSHI_HOST}{pos_endpoint}", headers=pos_headers, timeout=10)
+        pos_resp.raise_for_status()
+
+        positions = pos_resp.json().get("market_positions", [])
+        total_invested = 0.0
+        total_market_value = 0.0
+        total_realized = 0.0
+        total_fees = 0.0
+        open_positions = 0
+
+        for p in positions:
+            cost = abs(float(p.get("total_traded", 0) or 0)) / 100.0
+            market_exposure = float(p.get("market_exposure", 0) or 0) / 100.0
+            fees = float(p.get("fees_paid", 0) or 0) / 100.0
+            realized = float(p.get("realized_pnl", 0) or 0) / 100.0
+
+            total_realized += realized
+            total_fees += fees
+
+            if abs(market_exposure) > 0:
+                open_positions += 1
+                total_invested += cost
+                total_market_value += abs(market_exposure)
+
+        total_balance = available + total_market_value
+
+        result = {
+            "balance": available,
+            "payout": payout,
+            "open_positions": open_positions,
+            "total_invested": total_invested,
+            "total_market_value": total_market_value,
+            "unrealized_pnl": total_market_value - total_invested,
+            "realized_pnl": total_realized,
+            "total_fees": total_fees,
+            "total_balance": total_balance,
+        }
+        _pnl_cache["data"] = result
+        _pnl_cache["ts"] = now
+        return result
+    except Exception:
+        return {
+            "balance": 0, "payout": 0, "open_positions": 0,
+            "total_invested": 0, "total_market_value": 0, "unrealized_pnl": 0,
+            "realized_pnl": 0, "total_fees": 0, "total_balance": 0,
+        }
+
+
 def get_calibration_stats() -> dict:
     conn = _conn()
     total = conn.execute("SELECT COUNT(*) as c FROM calibration WHERE correct IS NOT NULL").fetchone()["c"]

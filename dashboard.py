@@ -27,7 +27,7 @@ def _is_live_mode() -> bool:
     trades = logger.get_recent_trades(limit=5)
     if not trades:
         return not config.DRY_RUN
-    return any(t["status"] in ("executed", "rejected_daily_limit") or
+    return any(t["status"] in ("filled", "placed", "rejected_daily_limit") or
                t["status"].startswith("error_http") for t in trades)
 
 console = Console()
@@ -122,14 +122,14 @@ def render_status() -> Panel:
     table.add_row("Kalshi Flow", f"[{POLY}]{len(kalshi_alerts)}[/{POLY}]")
     table.add_row("Total Signals", f"[{ACCENT}]{stats['total_trades']}[/{ACCENT}]")
     table.add_row("", "")
-    table.add_row("Kalshi Whale", "$10,000+ auto-trade")
+    table.add_row("Kalshi Whale", "$15K+ ($25K sports)")
     table.add_row("Kalshi Display", "$5,000+ dim")
     table.add_row("Poly Whale", "$20,000+")
     table.add_row("Poly Match", "45%+ keyword")
     table.add_row("Poly Poll", "5s")
     table.add_row("Sectors", f"[{POLY}]POLITICS CRYPTO[/{POLY}]")
     table.add_row("Price Filter", "$0.05–$0.85")
-    table.add_row("Poly Score", "35+ to trade")
+    table.add_row("Poly Score", "30+ to trade")
     table.add_row("Boosts", "sweet spot + cluster")
 
     return Panel(table, title="[bold]PIPELINE STATUS[/bold]", border_style="bright_green", box=box.ROUNDED)
@@ -144,7 +144,8 @@ def render_performance() -> Panel:
     total = stats["total_trades"]
     by_status = stats["by_status"]
     dry_runs = by_status.get("dry_run", 0)
-    executed = by_status.get("executed", 0)
+    filled = by_status.get("filled", 0)
+    placed = by_status.get("placed", 0)
     errors = sum(v for k, v in by_status.items() if k.startswith("error"))
 
     # Separate by source
@@ -165,13 +166,31 @@ def render_performance() -> Panel:
     table.add_row("  Exits", f"[{LOSS}]{len(exit_trades)}[/{LOSS}]")
     table.add_row("", "")
     table.add_row("Dry Runs", f"[{WARN}]{dry_runs}[/{WARN}]")
-    table.add_row("Executed", f"[{WIN}]{executed}[/{WIN}]")
+    cancelled = by_status.get("cancelled", 0)
+    table.add_row("Filled", f"[{WIN}]{filled}[/{WIN}]")
+    table.add_row("Cancelled", f"[{LOSS}]{cancelled}[/{LOSS}]")
     if errors:
         table.add_row("Errors", f"[{LOSS}]{errors}[/{LOSS}]")
     table.add_row("", "")
+    # Live P/L from Kalshi
+    pnl = logger.get_portfolio_pnl()
+    unrealized = pnl["unrealized_pnl"]
+    pnl_color = WIN if unrealized >= 0 else LOSS
+    pnl_sign = "+" if unrealized >= 0 else ""
+
+    realized = pnl.get("realized_pnl", 0)
+    rpnl_color = WIN if realized >= 0 else LOSS
+    rpnl_sign = "+" if realized >= 0 else ""
+    total_bal = pnl.get("total_balance", 0)
+
+    table.add_row("Balance", f"[{ACCENT}]${pnl['balance']:.2f}[/{ACCENT}]")
+    table.add_row("Total Value", f"[{ACCENT}]${total_bal:.2f}[/{ACCENT}]")
+    table.add_row("Open Positions", f"[{ACCENT}]{pnl['open_positions']}[/{ACCENT}]")
+    table.add_row("Unrealized P/L", f"[{pnl_color}]{pnl_sign}${unrealized:.2f}[/{pnl_color}]")
+    table.add_row("Realized P/L", f"[{rpnl_color}]{rpnl_sign}${realized:.2f}[/{rpnl_color}]")
+    table.add_row("", "")
     table.add_row("Daily Exposure", f"[{ACCENT}]${daily_spent:.2f}[/{ACCENT}]")
     table.add_row("Total Wagered", f"[{ACCENT}]${total_wagered:.2f}[/{ACCENT}]")
-    table.add_row("Avg Edge", f"[{ACCENT}]{avg_edge:.1f}%[/{ACCENT}]")
 
     if cal["total"] > 0:
         color = WIN if cal["accuracy"] >= 55 else (WARN if cal["accuracy"] >= 45 else LOSS)
@@ -332,8 +351,10 @@ def render_trades() -> Panel:
             status = t["status"]
             if status == "dry_run":
                 status_str = f"[{WARN}]DRY RUN[/{WARN}]"
-            elif status == "executed":
+            elif status == "filled":
                 status_str = f"[{WIN}]FILLED[/{WIN}]"
+            elif status == "cancelled":
+                status_str = f"[{LOSS}]CANCEL[/{LOSS}]"
             elif status.startswith("error"):
                 status_str = f"[{LOSS}]ERROR[/{LOSS}]"
             elif status == "rejected_daily_limit":

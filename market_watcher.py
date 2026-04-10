@@ -25,7 +25,9 @@ _console = Console()
 log = logging.getLogger(__name__)
 
 WHALE_THRESHOLD_USD = 5000  # minimum trade value to display (dim)
-WHALE_ALERT_USD = 10000  # threshold for whale alert + auto-trade
+WHALE_ALERT_USD = 15000  # threshold for whale alert + auto-trade
+WHALE_ALERT_SPORTS_USD = 25000  # higher threshold for sports (more gambling, less signal)
+SPORTS_KEYWORDS = {"GAME", "NBA", "NFL", "NHL", "MLB", "PGA", "UFC", "MMA", "SOCCER", "EPL", "FIFA"}
 
 
 @dataclass
@@ -142,14 +144,20 @@ class MarketWatcher:
         if trade.price_dollars > 0.85 or trade.price_dollars < 0.05:
             return
 
+        # Check if sports market
+        is_sports = any(kw in trade.ticker.upper() for kw in SPORTS_KEYWORDS) or \
+                    (market and market.category.lower() in ("sports",))
+        alert_threshold = WHALE_ALERT_SPORTS_USD if is_sports else WHALE_ALERT_USD
+
         # Display all trades above threshold
-        if value >= WHALE_ALERT_USD:
+        if value >= alert_threshold:
             self.stats["whales_detected"] += 1
             color = "bright_red" if value >= 25_000 else ("bright_yellow" if value >= 10_000 else "bright_cyan")
             tier = "WHALE" if value >= 25_000 else ("BIG" if value >= 10_000 else "LARGE")
             oi_str = f" [OI: ${market.open_interest:,.0f}]" if market and market.open_interest > 0 else ""
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
             _console.print(
-                f"  [{color}][{tier}][/{color}] "
+                f"  [{ts}] [{color}][{tier}][/{color}] "
                 f"${value:,.0f} {trade.side_label} "
                 f"({trade.count} contracts @${trade.price_dollars:.2f}) "
                 f"\"{trade.market_title[:45]}\"{oi_str} "

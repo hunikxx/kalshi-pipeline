@@ -30,45 +30,111 @@ async def execute_trade_async(signal: Signal) -> dict:
 
 
 def _execute_live(signal: Signal) -> dict:
-    """Place a real order via Kalshi API."""
+    """Place a real order via Kalshi API. Try at whale price, bump +1¢ up to +3¢ if not filled."""
+    import time
+    from rich.console import Console
+    _console = Console()
+
     try:
         ticker = signal.market.condition_id
         side = "yes" if signal.side == "YES" else "no"
-        price = signal.market.yes_price if side == "yes" else signal.market.no_price
 
-        # Kalshi uses contract counts — at the given price, how many contracts
-        # can we buy with our dollar amount?
-        # Each contract pays $1 on resolution, costs `price` to buy
-        count = int(signal.bet_amount / price) if price > 0 else 0
-        if count < 1:
-            return _log_and_return(signal, status="error_zero_contracts", order_id=None)
+        # Start at whale's price if available, otherwise market price
+        if signal.limit_price > 0:
+            base_price = signal.limit_price
+        else:
+            base_price = signal.market.yes_price if side == "yes" else signal.market.no_price
 
-        endpoint = "/portfolio/orders"
-        path = urlparse(f"{config.KALSHI_HOST}{endpoint}").path
-        headers = sign_request("POST", path)
-        headers["Content-Type"] = "application/json"
+        # Try +1¢, +2¢, +3¢ above whale price
+        for bump in range(1, 4):
+            price = min(base_price + (bump * 0.01), 0.99)
 
-        order_body = {
-            "ticker": ticker,
-            "side": side,
-            "action": "buy",
-            "count": count,
-            "type": "limit",
-            "yes_price": int(price * 100),  # Kalshi uses cents
-            "client_order_id": str(uuid.uuid4()),
-        }
+            count = int(signal.bet_amount / price) if price > 0 else 0
+            if count < 1:
+                return _log_and_return(signal, status="error_zero_contracts", order_id=None)
 
-        resp = httpx.post(
-            f"{config.KALSHI_HOST}{endpoint}",
-            headers=headers,
-            json=order_body,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        result = resp.json()
+            endpoint = "/portfolio/orders"
+            path = urlparse(f"{config.KALSHI_HOST}{endpoint}").path
+            headers = sign_request("POST", path)
+            headers["Content-Type"] = "application/json"
 
-        order_id = result.get("order", {}).get("order_id", "unknown")
-        return _log_and_return(signal, status="executed", order_id=order_id)
+            # Detect if this is an exit/sell signal
+            is_exit = "EXIT" in (signal.reasoning or "")
+            action = "sell" if is_exit else "buy"
+
+            # For sells, use the original side (not the flipped one)
+            if is_exit:
+                side = "no" if side == "yes" else "yes"
+
+            order_body = {
+                "ticker": ticker,
+                "side": side,
+                "action": action,
+                "count": count,
+                "type": "limit",
+                "yes_price": int(price * 100),
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+            resp = httpx.post(
+                f"{config.KALSHI_HOST}{endpoint}",
+                headers=headers,
+                json=order_body,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            order = result.get("order", {})
+            order_id = order.get("order_id", "unknown")
+            order_status = order.get("status", "unknown")
+
+            # Filled immediately
+            if order_status == "executed":
+                if bump > 0:
+                    _console.print(f"    [dim]filled at +{bump}¢ (${price:.2f})[/dim]")
+                return _log_and_return(signal, status="filled", order_id=order_id)
+
+            # Resting — wait 10s for fill
+            if order_status in ("resting", "pending"):
+                cancel_endpoint = f"/portfolio/orders/{order_id}"
+                for _ in range(2):
+                    time.sleep(5)
+                    try:
+                        check_path = urlparse(f"{config.KALSHI_HOST}{cancel_endpoint}").path
+                        check_headers = sign_request("GET", check_path)
+                        check_resp = httpx.get(
+                            f"{config.KALSHI_HOST}{cancel_endpoint}",
+                            headers=check_headers,
+                            timeout=10,
+                        )
+                        check_resp.raise_for_status()
+                        current_status = check_resp.json().get("order", {}).get("status", "")
+                        if current_status == "executed":
+                            if bump > 0:
+                                _console.print(f"    [dim]filled at +{bump}¢ (${price:.2f})[/dim]")
+                            return _log_and_return(signal, status="filled", order_id=order_id)
+                    except Exception:
+                        pass
+
+                # Not filled after 10s — cancel and try next price
+                try:
+                    cancel_path = urlparse(f"{config.KALSHI_HOST}{cancel_endpoint}").path
+                    cancel_headers = sign_request("DELETE", cancel_path)
+                    httpx.delete(
+                        f"{config.KALSHI_HOST}{cancel_endpoint}",
+                        headers=cancel_headers,
+                        timeout=10,
+                    )
+                    if bump < 3:
+                        _console.print(f"    [dim]not filled at +{bump}¢ (${price:.2f}), bumping to +{bump+1}¢...[/dim]")
+                except Exception:
+                    pass
+
+                continue
+
+        # All 4 attempts failed
+        return _log_and_return(signal, status="cancelled", order_id=None)
 
     except httpx.HTTPStatusError as e:
         return _log_and_return(signal, status=f"error_http_{e.response.status_code}", order_id=None)

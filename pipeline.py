@@ -76,6 +76,9 @@ class PipelineV4:
         console.print(f"  Max bet: ${config.MAX_BET_USD} | Daily limit: ${config.DAILY_LOSS_LIMIT_USD}")
         console.print()
 
+        # Check existing holdings for positions above sell threshold
+        await self._check_holdings_on_startup()
+
         try:
             await asyncio.gather(
                 self.market_watcher.run(),           # Kalshi markets + WebSocket trade feed
@@ -334,6 +337,106 @@ class PipelineV4:
             total_latency_ms=event.latency_ms + new_cls.latency_ms,
         )
 
+    async def _check_holdings_on_startup(self):
+        """Check existing Kalshi holdings and sell any above profit threshold."""
+        if config.DRY_RUN:
+            return
+
+        try:
+            import httpx
+            from urllib.parse import urlparse
+            from kalshi_auth import sign_request
+            from datetime import datetime, timezone
+
+            endpoint = "/portfolio/positions"
+            path = urlparse(f"{config.KALSHI_HOST}{endpoint}").path
+            headers = sign_request("GET", path)
+            resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: httpx.get(f"{config.KALSHI_HOST}{endpoint}", headers=headers, timeout=10)
+            )
+            resp.raise_for_status()
+
+            positions = resp.json().get("market_positions", [])
+            if not positions:
+                console.print(f"  [dim]No existing holdings to check[/dim]")
+                return
+
+            sell_threshold = self.poly_tracker._price_target_cents
+            console.print(f"  [bright_cyan]Checking {len(positions)} holdings (sell threshold: +{sell_threshold:.0%})...[/bright_cyan]")
+
+            for pos in positions:
+                ticker = pos.get("ticker", "")
+                quantity = pos.get("total_traded", 0)
+                if quantity <= 0:
+                    continue
+
+                # Get current market price
+                market_resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda t=ticker: httpx.get(
+                        f"{config.KALSHI_HOST}/markets/{t}",
+                        headers=sign_request("GET", f"/trade-api/v2/markets/{t}"),
+                        timeout=10,
+                    )
+                )
+                if market_resp.status_code != 200:
+                    continue
+
+                market_data = market_resp.json().get("market", {})
+                current_price = float(market_data.get("last_price_dollars", 0) or 0)
+
+                # Check resting_orders_count or position details
+                position_side = "yes" if pos.get("market_exposure", 0) > 0 else "no"
+                avg_price = float(pos.get("realized_pnl", 0) or 0)  # approximate
+
+                # If we have position data with fees_paid, estimate entry
+                fees = float(pos.get("fees_paid", 0) or 0)
+                total_cost = float(pos.get("total_traded", 0) or 0)
+
+                ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                title = market_data.get("title", ticker)[:40]
+
+                # Simple check: if current price is high enough, sell
+                if current_price >= (1.0 - sell_threshold):
+                    console.print(
+                        f"  [{ts}] [bright_green]STARTUP SELL[/bright_green] "
+                        f"{ticker} current: ${current_price:.2f} "
+                        f"above threshold — queuing sell"
+                    )
+
+                    from markets import Market
+                    m = Market(
+                        condition_id=ticker,
+                        question=title,
+                        category="",
+                        yes_price=current_price,
+                        no_price=1.0 - current_price,
+                        volume=0,
+                        end_date="",
+                        active=True,
+                        tokens=[],
+                    )
+
+                    signal = Signal(
+                        market=m,
+                        claude_score=0,
+                        market_price=current_price,
+                        edge=0,
+                        side="YES",
+                        bet_amount=0,  # sell all
+                        reasoning=f"EXIT: startup_check — price ${current_price:.2f} above threshold",
+                        headlines=f"Startup exit: {title}",
+                        news_source="startup",
+                        classification="exit",
+                    )
+                    await self.signal_queue.put(signal)
+
+            console.print(f"  [dim]Holdings check complete[/dim]")
+
+        except Exception as e:
+            console.print(f"  [yellow]Holdings check error: {e}[/yellow]")
+
     async def _wait_then_start_poly(self):
         """Wait for Kalshi markets to load, then start Polymarket tracker."""
         while not self.market_watcher.all_markets:
@@ -361,35 +464,65 @@ class PipelineV4:
             size = sig["size"]
             pattern = sig.get("pattern", "")
             wallet = sig.get("wallet_name", "?")
+            is_exit = sig.get("type") == "poly_exit"
 
-            # Scale bet by score (50=min signal, 100=max)
-            bet_frac = min((score - 30) / 70.0, 1.0)
-            bet_amount = round(max(1.0, config.MAX_BET_USD * bet_frac), 2)
-            edge = min(score / 100.0 * 0.3, 0.30)
+            if is_exit:
+                # Exit: sell at entry size
+                bet_amount = size  # size is bet_amount for exits
+                edge = 0.0
 
-            signal = Signal(
-                market=market,
-                claude_score=edge,
-                market_price=market.yes_price,
-                edge=edge,
-                side=side,
-                bet_amount=bet_amount,
-                reasoning=f"POLY WHALE: ${size:,.0f} {side} by {wallet} (score:{score}, {pattern or 'new'})",
-                headlines=f"Polymarket whale: {side} ${size:,.0f} @{sig.get('poly_price', 0):.2f}",
-                news_source="polymarket",
-                classification=f"poly_{side.lower()}",
-                materiality=score / 100.0,
-            )
+                signal = Signal(
+                    market=market,
+                    claude_score=0,
+                    market_price=market.yes_price,
+                    edge=edge,
+                    side=side,
+                    bet_amount=bet_amount,
+                    reasoning=f"EXIT: {pattern} on {market.question[:40]}",
+                    headlines=f"Exit: {pattern}",
+                    news_source="polymarket",
+                    classification="exit",
+                    materiality=0,
+                )
 
-            self.stats["signals_found"] += 1
-            await self.signal_queue.put(signal)
+                self.stats["signals_found"] += 1
+                self.stats["exits_triggered"] += 1
+                await self.signal_queue.put(signal)
 
-            console.print(
-                f"  [bright_magenta]POLY→KALSHI[/bright_magenta] "
-                f"{side} ${bet_amount} edge:{edge:.1%} "
-                f"whale:{wallet} ${size:,.0f} score:{score} "
-                f"→ \"{market.question[:40]}...\""
-            )
+                console.print(
+                    f"  [bright_red]EXIT {pattern.upper()}[/bright_red] "
+                    f"SELL {side} ${bet_amount:.2f} "
+                    f"on \"{market.question[:40]}...\""
+                )
+            else:
+                # Buy: scale bet by score
+                bet_frac = min((score - 30) / 70.0, 1.0)
+                bet_amount = round(max(1.0, config.MAX_BET_USD * bet_frac), 2)
+                edge = min(score / 100.0 * 0.3, 0.30)
+
+                signal = Signal(
+                    market=market,
+                    claude_score=edge,
+                    market_price=market.yes_price,
+                    edge=edge,
+                    side=side,
+                    bet_amount=bet_amount,
+                    reasoning=f"POLY WHALE: ${size:,.0f} {side} by {wallet} (score:{score}, {pattern or 'new'})",
+                    headlines=f"Polymarket whale: {side} ${size:,.0f} @{sig.get('poly_price', 0):.2f}",
+                    news_source="polymarket",
+                    classification=f"poly_{side.lower()}",
+                    materiality=score / 100.0,
+                )
+
+                self.stats["signals_found"] += 1
+                await self.signal_queue.put(signal)
+
+                console.print(
+                    f"  [bright_magenta]POLY→KALSHI[/bright_magenta] "
+                    f"{side} ${bet_amount} edge:{edge:.1%} "
+                    f"whale:{wallet} ${size:,.0f} score:{score} "
+                    f"→ \"{market.question[:40]}...\""
+                )
 
     async def _process_flow_signals(self):
         """Convert whale/flow alerts from market watcher into trade signals."""
@@ -434,6 +567,9 @@ class PipelineV4:
             bet_amount = config.MAX_BET_USD * bet_frac * price_mult * cluster_mult
             bet_amount = round(max(1.0, min(bet_amount, config.MAX_BET_USD)), 2)
 
+            # Start at whale's price, executor will bump +1¢ increments if not filled
+            limit_price = price
+
             signal = Signal(
                 market=market,
                 claude_score=edge,
@@ -450,10 +586,27 @@ class PipelineV4:
                 news_source="flow",
                 classification=f"flow_{side.lower()}",
                 materiality=min(oi_ratio * 4, 1.0),
+                limit_price=limit_price,
             )
 
             self.stats["signals_found"] += 1
             await self.signal_queue.put(signal)
+
+            # Track position for exit strategy (reuse poly tracker's exit check)
+            from polymarket_tracker import OpenPosition
+            import time as _time
+            pos = OpenPosition(
+                kalshi_ticker=market.condition_id,
+                kalshi_market=market,
+                poly_condition_id="",
+                side=side,
+                entry_price=price,
+                bet_amount=bet_amount,
+                entry_time=_time.time(),
+                entry_wallet="kalshi_flow",
+                entry_score=int(oi_ratio * 100),
+            )
+            self.poly_tracker.open_positions[market.condition_id] = pos
 
             boosts = []
             if price_mult > 1.1:
@@ -481,8 +634,10 @@ class PipelineV4:
             is_exit = "EXIT" in (signal.reasoning or "")
             src = signal.news_source or "—"
 
-            if status == "executed":
+            if status == "filled":
                 status_str = "[bold bright_white on green] FILLED [/bold bright_white on green]"
+            elif status == "cancelled":
+                status_str = "[bold white on red] CANCELLED [/bold white on red]"
             elif status == "dry_run":
                 status_str = "[bold black on yellow] DRY RUN [/bold black on yellow]"
             else:
@@ -495,9 +650,12 @@ class PipelineV4:
             else:
                 action_str = "[bold white on magenta] BUY NO [/bold white on magenta]"
 
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
             console.print()
             console.print(
-                f"  {status_str} {action_str} "
+                f"  [{ts}] {status_str} {action_str} "
                 f"[bold]${result['amount']:.2f}[/bold] "
                 f"on [bold]\"{result['market'][:45]}\"[/bold]"
             )
