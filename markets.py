@@ -237,13 +237,33 @@ def _infer_category(title: str, kalshi_category: str) -> str:
         return "economy"
     if any(kw in combined for kw in ["weather", "hurricane", "temperature", "storm", "tornado", "flood"]):
         return "weather"
-    return kalshi_category if kalshi_category else "other"
+    if any(kw in combined for kw in ["nba", "nfl", "nhl", "mlb", "soccer", "football", "basketball",
+                                      "baseball", "hockey", "tennis", "golf", "ufc", "mma", "boxing",
+                                      "olympics", "fifa", "pga", "cricket", "ipl", "f1", "nascar",
+                                      "playoff", "championship", "match", "game", "win on 202",
+                                      "marseille", "olympique", "ligue", "laliga", "bundesliga",
+                                      "premier league", "champions league", "serie a"]):
+        return "sports"
+    if any(kw in combined for kw in ["health", "covid", "vaccine", "fda", "drug", "medical", "disease", "pandemic"]):
+        return "health"
+    if any(kw in combined for kw in ["stock", "s&p", "nasdaq", "dow", "market cap", "ipo", "earnings"]):
+        return "financials"
+    if any(kw in combined for kw in ["airline", "flight", "shipping", "transportation", "rail", "ev"]):
+        return "transportation"
+    if any(kw in combined for kw in ["company", "ceo", "merger", "acquisition", "layoff", "revenue"]):
+        return "companies"
+    if any(kw in combined for kw in ["social media", "twitter", "tiktok", "instagram", "youtube", "influencer"]):
+        return "social"
+    if any(kw in combined for kw in ["war", "conflict", "nato", "united nations", "geopolitical", "china", "russia", "ukraine", "middle east"]):
+        return "world"
+    # Normalize Kalshi's raw category to lowercase
+    return kalshi_category.lower() if kalshi_category else "other"
 
 
 def filter_by_categories(markets: list[Market], categories: list[str] | None = None) -> list[Market]:
     """Filter markets to only target categories."""
-    cats = categories or config.MARKET_CATEGORIES
-    return [m for m in markets if m.category in cats]
+    cats = {c.lower() for c in (categories or config.MARKET_CATEGORIES)}
+    return [m for m in markets if m.category.lower() in cats]
 
 
 def get_token_id(market: Market, side: str) -> str | None:

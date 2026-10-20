@@ -52,7 +52,8 @@ RSS_FEEDS = [
 
 # --- Pipeline Settings ---
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-MAX_BET_USD = float(os.getenv("MAX_BET_USD", "10"))
+MAX_BET_USD = float(os.getenv("MAX_BET_USD", "50"))
+MAX_BET_SPORTS_USD = float(os.getenv("MAX_BET_SPORTS_USD", "25"))
 DAILY_LOSS_LIMIT_USD = float(os.getenv("DAILY_LOSS_LIMIT_USD", "100"))
 EDGE_THRESHOLD = float(os.getenv("EDGE_THRESHOLD", "0.10"))
 NEWS_LOOKBACK_HOURS = 6
@@ -75,7 +76,14 @@ MARKET_CATEGORIES = [
     "science",
     "economy",
     "weather",
+    "health",
+    "financials",
+    "transportation",
+    "companies",
+    "social",
+    "world",
     "other",
+    # "sports" excluded — whale bot skips sports
 ]
 
 # --- Twitter filter keywords (for filtered stream rules) ---

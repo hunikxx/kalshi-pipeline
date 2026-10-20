@@ -46,7 +46,7 @@ class PipelineV4:
         self.signal_queue: asyncio.Queue = asyncio.Queue()
         self.news_aggregator = NewsAggregator(self.news_queue)
         self.market_watcher = MarketWatcher()
-        self.poly_tracker = PolymarketTracker(min_trade_usd=20_000)
+        self.poly_tracker = PolymarketTracker(min_trade_usd=5_000)
         self.running = False
         # Clustering buffer
         self._cluster_buffer: list[NewsEvent] = []
@@ -70,10 +70,11 @@ class PipelineV4:
         self.market_watcher.signal_queue = asyncio.Queue()
         self.poly_tracker.signal_queue = asyncio.Queue()
         mode = "[red bold]LIVE[/red bold]" if not config.DRY_RUN else "[yellow]DRY RUN[/yellow]"
-        console.print(Panel(f"Pipeline V4 Starting  |  Mode: {mode}", style="bright_green"))
-        console.print(f"  Kalshi trade feed: WebSocket → whale trades $5K+ → auto-trade")
-        console.print(f"  Polymarket whale tracker: $25K+ trades → match to Kalshi → auto-trade")
-        console.print(f"  Max bet: ${config.MAX_BET_USD} | Daily limit: ${config.DAILY_LOSS_LIMIT_USD}")
+        from market_watcher import WHALE_ALERT_USD
+        console.print(Panel(f"Pipeline V5 Starting  |  Mode: {mode}", style="bright_green"))
+        console.print(f"  Kalshi trade feed: WebSocket → whale trades ${WHALE_ALERT_USD:,.0f}+ → auto-trade")
+        console.print(f"  Polymarket whale tracker: ${self.poly_tracker.min_trade_usd:,.0f}+ trades → match to Kalshi → auto-trade")
+        console.print(f"  Max bet: ${config.MAX_BET_USD:.0f} (${config.MAX_BET_SPORTS_USD:.0f} sports) | Daily limit: ${config.DAILY_LOSS_LIMIT_USD:.0f}")
         console.print()
 
         # Check existing holdings for positions above sell threshold
@@ -362,8 +363,8 @@ class PipelineV4:
                 console.print(f"  [dim]No existing holdings to check[/dim]")
                 return
 
-            sell_threshold = self.poly_tracker._price_target_cents
-            console.print(f"  [bright_cyan]Checking {len(positions)} holdings (sell threshold: +{sell_threshold:.0%})...[/bright_cyan]")
+            sell_pct = self.poly_tracker._price_target_pct
+            console.print(f"  [bright_cyan]Checking {len(positions)} holdings (sell threshold: +{sell_pct:.0%} of entry)...[/bright_cyan]")
 
             for pos in positions:
                 ticker = pos.get("ticker", "")
@@ -495,10 +496,23 @@ class PipelineV4:
                     f"on \"{market.question[:40]}...\""
                 )
             else:
-                # Buy: scale bet by score
+                # Buy: scale bet by score, then apply wallet multiplier
+                # Sports markets capped at MAX_BET_SPORTS_USD
+                from telegram_notifier import _is_sports
+                max_bet = config.MAX_BET_SPORTS_USD if _is_sports(
+                    market.question,
+                    ticker=getattr(market, "condition_id", ""),
+                    category=getattr(market, "category", ""),
+                ) else config.MAX_BET_USD
                 bet_frac = min((score - 30) / 70.0, 1.0)
-                bet_amount = round(max(1.0, config.MAX_BET_USD * bet_frac), 2)
+                wallet_mult = sig.get("wallet_multiplier", 1.0)
+                bet_amount = round(max(1.0, max_bet * bet_frac * wallet_mult), 2)
                 edge = min(score / 100.0 * 0.3, 0.30)
+
+                wr = sig.get("wallet_win_rate", -1)
+                wt = sig.get("wallet_tier", "unknown")
+                wr_label = f" WR:{wr:.0f}%({wt})" if wr >= 0 else ""
+                fade_label = " [FADE]" if sig.get("wallet_multiplier", 1.0) != wallet_mult else ""
 
                 signal = Signal(
                     market=market,
@@ -507,7 +521,7 @@ class PipelineV4:
                     edge=edge,
                     side=side,
                     bet_amount=bet_amount,
-                    reasoning=f"POLY WHALE: ${size:,.0f} {side} by {wallet} (score:{score}, {pattern or 'new'})",
+                    reasoning=f"POLY WHALE: ${size:,.0f} {side} by {wallet} (score:{score}, {pattern or 'new'}{wr_label}{fade_label})",
                     headlines=f"Polymarket whale: {side} ${size:,.0f} @{sig.get('poly_price', 0):.2f}",
                     news_source="polymarket",
                     classification=f"poly_{side.lower()}",
@@ -517,10 +531,11 @@ class PipelineV4:
                 self.stats["signals_found"] += 1
                 await self.signal_queue.put(signal)
 
+                mult_str = f" ×{wallet_mult:.1f}" if wallet_mult != 1.0 else ""
                 console.print(
                     f"  [bright_magenta]POLY→KALSHI[/bright_magenta] "
                     f"{side} ${bet_amount} edge:{edge:.1%} "
-                    f"whale:{wallet} ${size:,.0f} score:{score} "
+                    f"whale:{wallet} ${size:,.0f} score:{score}{wr_label}{mult_str} "
                     f"→ \"{market.question[:40]}...\""
                 )
 
@@ -565,7 +580,7 @@ class PipelineV4:
             # --- Final bet calculation ---
             bet_frac = min(oi_ratio / 0.25, 1.0)
             bet_amount = config.MAX_BET_USD * bet_frac * price_mult * cluster_mult
-            bet_amount = round(max(1.0, min(bet_amount, config.MAX_BET_USD)), 2)
+            bet_amount = round(max(1.0, min(bet_amount, config.MAX_BET_USD)), 2)  # non-sports only (sports blocked)
 
             # Start at whale's price, executor will bump +1¢ increments if not filled
             limit_price = price

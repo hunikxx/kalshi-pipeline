@@ -1,0 +1,25 @@
+{
+  "_description": "Top Polymarket performers — every non-sports trade they make triggers an auto-buy regardless of size/score/sector filters. Matched by wallet address OR name.",
+  "wallets": [
+    {"name": "denizz",                   "address": null,                                         "pnl": 954895,  "volume": 2530146},
+    {"name": "The Spirit of Ukraine>UMA","address": null,                                         "pnl": 530536,  "volume": 1957354},
+    {"name": "Erasmus.",                 "address": "0xc6587b11a2209e46dfe3928b31c5514a8e33b784", "pnl": 427547,  "volume": 621966},
+    {"name": "SecondWindCapital",        "address": null,                                         "pnl": 423206,  "volume": null},
+    {"name": "CypherCapital",            "address": null,                                         "pnl": 405330,  "volume": null},
+    {"name": "Wickier",                  "address": "0x1cc16713196d456f86fa9c7387dd326a7f73b8df", "pnl": 394694,  "volume": 480853},
+    {"name": "wan123",                   "address": null,                                         "pnl": 384003,  "volume": 2188561},
+    {"name": "UpDownUpDown",             "address": null,                                         "pnl": 364892,  "volume": 222222},
+    {"name": "lava-lava",                "address": null,                                         "pnl": 359601,  "volume": 121704},
+    {"name": "polywog",                  "address": null,                                         "pnl": 356146,  "volume": 6030},
+    {"name": "djijaij83jdo4jdlwjflsg",   "address": "0xa4eb52229991c074bc560f825bf2776d77acd010", "pnl": 338421,  "volume": null},
+    {"name": "Fernandoinfante",          "address": null,                                         "pnl": 330089,  "volume": 1267389},
+    {"name": "nojnn",                    "address": null,                                         "pnl": 314039,  "volume": 1189924},
+    {"name": "alienreal",                "address": null,                                         "pnl": 296761,  "volume": 1013404},
+    {"name": "APRIL26",                  "address": "0xfd66d7ed45d7962ad009e669cdaec9319e38fb6d", "pnl": 293932,  "volume": 646758},
+    {"name": "GCottrell93",              "address": null,                                         "pnl": 264242,  "volume": null},
+    {"name": "EB99999",                  "address": null,                                         "pnl": 262254,  "volume": 1289392},
+    {"name": "Car",                      "address": "0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b", "pnl": 253592,  "volume": 2861550},
+    {"name": "trevors4",                 "address": null,                                         "pnl": 252212,  "volume": null},
+    {"name": "(unknown)",                "address": "0xCB3143ee858E14d0B3FE40fFeaEa78416e646B00", "pnl": 235492,  "volume": null}
+  ]
+}

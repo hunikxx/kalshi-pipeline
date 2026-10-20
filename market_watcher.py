@@ -13,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from telegram_notifier import send_whale_alert
+
 import httpx
 
 import config
@@ -25,9 +27,15 @@ _console = Console()
 log = logging.getLogger(__name__)
 
 WHALE_THRESHOLD_USD = 5000  # minimum trade value to display (dim)
-WHALE_ALERT_USD = 15000  # threshold for whale alert + auto-trade
-WHALE_ALERT_SPORTS_USD = 25000  # higher threshold for sports (more gambling, less signal)
-SPORTS_KEYWORDS = {"GAME", "NBA", "NFL", "NHL", "MLB", "PGA", "UFC", "MMA", "SOCCER", "EPL", "FIFA"}
+WHALE_ALERT_USD = 5000  # threshold for whale alert + auto-trade (non-sports only)
+SPORTS_KEYWORDS = {
+    "GAME", "NBA", "NFL", "NHL", "MLB", "PGA", "UFC", "MMA", "SOCCER", "EPL",
+    "FIFA", "UCL", "LALIGA", "BUNDES", "SERIE", "LIGUE", "IPL", "T20", "CWC",
+    "NASCAR", "MOTO", "SGP", "NBASGP", "F1", "ATP", "WTA", "MASTERS", "WCUP",
+    "WORLDCUP", "CRICKET", "TENNIS", "GOLF", "BOXING",
+    # Match-outcome / advance-style keywords in ticker
+    "ADVANCE", "MATCH", "PLAYOFF", "FINAL", "SEMI", "QUARTER",
+}
 
 
 @dataclass
@@ -144,13 +152,8 @@ class MarketWatcher:
         if trade.price_dollars > 0.85 or trade.price_dollars < 0.05:
             return
 
-        # Check if sports market
-        is_sports = any(kw in trade.ticker.upper() for kw in SPORTS_KEYWORDS) or \
-                    (market and market.category.lower() in ("sports",))
-        alert_threshold = WHALE_ALERT_SPORTS_USD if is_sports else WHALE_ALERT_USD
-
-        # Display all trades above threshold
-        if value >= alert_threshold:
+        # Display all trades above threshold (unified for all categories)
+        if value >= WHALE_ALERT_USD:
             self.stats["whales_detected"] += 1
             color = "bright_red" if value >= 25_000 else ("bright_yellow" if value >= 10_000 else "bright_cyan")
             tier = "WHALE" if value >= 25_000 else ("BIG" if value >= 10_000 else "LARGE")
@@ -188,6 +191,18 @@ class MarketWatcher:
             self.flow_alerts.append(alert)
             self.flow_alerts = self.flow_alerts[-50:]
 
+            # Telegram notification (non-sports only, handled inside)
+            asyncio.create_task(send_whale_alert(
+                source="Kalshi",
+                title=trade.market_title,
+                side=trade.side_label,
+                value=value,
+                price=trade.price_dollars,
+                count=trade.count,
+                ticker=trade.ticker,
+                category=market.category if market else "",
+            ))
+
             # Track whale clustering — how many whales on this ticker in last 10 min
             now = time.time()
             if trade.ticker not in self._whale_cluster:
@@ -205,8 +220,15 @@ class MarketWatcher:
                     f"{trade.ticker} — {cluster_count} whales in 10 min"
                 )
 
-            # Emit trade signal for auto-trading
-            if market and self.signal_queue:
+            # Emit trade signal for auto-trading (skip sports)
+            # Use the same title-based detector as Telegram for consistent coverage
+            from telegram_notifier import _is_sports as _title_is_sports
+            is_sports = (
+                any(kw in trade.ticker.upper() for kw in SPORTS_KEYWORDS)
+                or (market and market.category.lower() in ("sports",))
+                or _title_is_sports(trade.market_title or "", ticker=trade.ticker, category=(market.category if market else ""))
+            )
+            if market and self.signal_queue and not is_sports:
                 self.signal_queue.put_nowait({
                     "type": "flow_signal",
                     "market": market,
@@ -217,6 +239,8 @@ class MarketWatcher:
                     "count": trade.count,
                     "cluster_count": cluster_count,
                 })
+            elif is_sports:
+                _console.print(f"    [dim]→ skipped auto-trade (sports)[/dim]")
 
         else:
             # Log smaller notable trades dimly
@@ -242,9 +266,14 @@ class MarketWatcher:
                 # Kalshi WS requires auth
                 ws_path = "/trade-api/ws/v2"
                 headers = auth_headers("GET", ws_path)
+                # Use native keepalive (ping_interval/timeout) — more robust than manual ping loop
                 async with websockets.connect(
                     config.KALSHI_WS_HOST,
                     additional_headers=headers,
+                    ping_interval=30,
+                    ping_timeout=60,
+                    close_timeout=10,
+                    max_queue=1024,
                 ) as ws:
                     self._ws_connected = True
                     backoff = 2
@@ -260,32 +289,20 @@ class MarketWatcher:
                     await ws.send(json.dumps(sub))
                     _console.print(f"  [bright_green][kalshi][/bright_green] WebSocket connected — streaming all trades")
 
-                    # Ping every 10s to keep alive (polymaster approach)
-                    async def ping_loop():
-                        while True:
-                            await asyncio.sleep(10)
-                            try:
-                                await ws.ping()
-                            except Exception:
-                                break
-
-                    ping_task = asyncio.create_task(ping_loop())
-
-                    try:
-                        while True:
-                            try:
-                                msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                                self.stats["ws_messages"] += 1
-                                data = json.loads(msg)
-                                await self._handle_trade_message(data)
-                            except asyncio.TimeoutError:
-                                continue  # ping_loop handles keepalive
-                    finally:
-                        ping_task.cancel()
+                    # Simple recv loop — native keepalive handles pings
+                    async for msg in ws:
+                        self.stats["ws_messages"] += 1
+                        try:
+                            data = json.loads(msg)
+                            await self._handle_trade_message(data)
+                        except Exception as parse_err:
+                            log.debug(f"trade parse error: {parse_err}")
+                            continue
 
             except Exception as e:
                 self._ws_connected = False
-                _console.print(f"  [yellow][kalshi][/yellow] WebSocket error: {e}, reconnecting in {backoff}s")
+                err_type = type(e).__name__
+                _console.print(f"  [yellow][kalshi][/yellow] WebSocket error ({err_type}): {e}, reconnecting in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 

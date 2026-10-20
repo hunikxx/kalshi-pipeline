@@ -95,11 +95,11 @@ def _execute_live(signal: Signal) -> dict:
                     _console.print(f"    [dim]filled at +{bump}¢ (${price:.2f})[/dim]")
                 return _log_and_return(signal, status="filled", order_id=order_id)
 
-            # Resting — wait 10s for fill
+            # Resting — wait 3s for fill
             if order_status in ("resting", "pending"):
                 cancel_endpoint = f"/portfolio/orders/{order_id}"
-                for _ in range(2):
-                    time.sleep(5)
+                for _ in range(1):
+                    time.sleep(3)
                     try:
                         check_path = urlparse(f"{config.KALSHI_HOST}{cancel_endpoint}").path
                         check_headers = sign_request("GET", check_path)
@@ -117,7 +117,7 @@ def _execute_live(signal: Signal) -> dict:
                     except Exception:
                         pass
 
-                # Not filled after 10s — cancel and try next price
+                # Not filled after 3s — cancel and try next price
                 try:
                     cancel_path = urlparse(f"{config.KALSHI_HOST}{cancel_endpoint}").path
                     cancel_headers = sign_request("DELETE", cancel_path)
@@ -137,8 +137,17 @@ def _execute_live(signal: Signal) -> dict:
         return _log_and_return(signal, status="cancelled", order_id=None)
 
     except httpx.HTTPStatusError as e:
+        # Log the actual error body so we know WHY it failed
+        try:
+            body = e.response.text[:200]
+        except Exception:
+            body = "(no body)"
+        from rich.console import Console
+        Console().print(f"    [red]HTTP {e.response.status_code}: {body}[/red]")
         return _log_and_return(signal, status=f"error_http_{e.response.status_code}", order_id=None)
     except Exception as e:
+        from rich.console import Console
+        Console().print(f"    [red]{type(e).__name__}: {e}[/red]")
         return _log_and_return(signal, status=f"error_{type(e).__name__}", order_id=None)
 
 

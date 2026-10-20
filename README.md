@@ -219,13 +219,13 @@ Trades $15K+ trigger auto-trade signals ($25K for sports markets). Unknown marke
 Polymarket whale trades are matched to Kalshi markets by keyword Jaccard similarity (45% threshold). Stopwords are removed before comparison. Matched trades are scored 0–100 — score 35+ triggers a trade.
 
 ### 5. Bet Sizing
-Bet amount ($1–$10) is calculated from multiple factors:
+Bet amount ($1–$25) is calculated from multiple factors:
 - **OI ratio**: whale trade as percentage of market open interest
 - **Sweet spot pricing**: lower-priced contracts (more upside) get up to 1.5x multiplier
 - **Whale clustering**: multiple whales on same market in 10 min = 1.5–2x boost
 
 ### 6. Order Execution
-Orders try at whale price +1¢. If not filled in 10s, bumps to +2¢, then +3¢. Auto-cancels after all attempts. Dry-run by default. Safety: $10 max bet, $100 daily limit. 5-minute cooldown per market.
+Orders try at whale price +1¢. If not filled in 10s, bumps to +2¢, then +3¢. Auto-cancels after all attempts. Dry-run by default. Safety: $25 max bet, $100 daily limit. 5-minute cooldown per market.
 
 ### 7. Exit Strategy
 - **Whale reversal**: same Polymarket wallet flips to opposite side → sell
@@ -239,7 +239,7 @@ Orders try at whale price +1¢. If not filled in 10s, bumps to +2¢, then +3¢. 
 | Setting | Default | What it does |
 |---|---|---|
 | `DRY_RUN` | `true` | Set to `false` for live trading |
-| `MAX_BET_USD` | `10` | Maximum single bet |
+| `MAX_BET_USD` | `25` | Maximum single bet |
 | `DAILY_LOSS_LIMIT_USD` | `100` | Pipeline halts if breached |
 | `KALSHI_WHALE_USD` | `15000` | Kalshi trade size to auto-trade ($25K sports) |
 | `POLY_WHALE_USD` | `20000` | Polymarket trade size to track |
@@ -253,7 +253,7 @@ Orders try at whale price +1¢. If not filled in 10s, bumps to +2¢, then +3¢. 
 ## Safety
 
 - Dry-run mode ON by default
-- $10 max single bet, $100 daily limit
+- $25 max single bet, $100 daily limit
 - Price filter: only trade contracts $0.05–$0.85
 - Duplicate trade prevention — 5-minute cooldown per market
 - Exit strategy — whale reversal + price target (+8¢)

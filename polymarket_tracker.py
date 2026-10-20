@@ -13,6 +13,10 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
+
+from telegram_notifier import send_whale_alert
+from wallet_scorer import get_wallet_stats, WalletStats
+from followed import is_followed
 from difflib import SequenceMatcher
 
 import httpx
@@ -29,7 +33,7 @@ TRADES_URL = "https://data-api.polymarket.com/trades"
 POLL_INTERVAL = 5  # seconds between polls (speed premium)
 
 # Only track whales in these sectors
-TRACKED_SECTORS = {"politics", "crypto"}
+TRACKED_SECTORS = {"politics", "crypto", "economy", "ai_tech", "science", "world", "entertainment"}
 SECTOR_KEYWORDS = {
     "politics": [
         "president", "election", "trump", "biden", "congress", "senate", "governor",
@@ -42,7 +46,40 @@ SECTOR_KEYWORDS = {
         "defi", "token", "coin", "nft", "binance", "coinbase", "altcoin",
         "stablecoin", "mining", "halving", "sec crypto", "etf bitcoin",
     ],
+    "economy": [
+        "fed", "federal reserve", "inflation", "interest rate", "gdp", "recession",
+        "unemployment", "jobs", "cpi", "treasury", "bond", "stock", "s&p", "nasdaq",
+        "dow", "trade deficit", "debt ceiling", "fiscal", "monetary",
+    ],
+    "ai_tech": [
+        "openai", "chatgpt", "google", "apple", "microsoft", "meta", "nvidia",
+        "artificial intelligence", "ai ", "machine learning", "robot", "self-driving",
+        "spacex", "tesla", "semiconductor", "chip", "tech", "startup",
+    ],
+    "science": [
+        "climate", "nasa", "space", "mars", "moon", "asteroid", "vaccine",
+        "pandemic", "virus", "fda", "drug", "trial", "scientific", "discovery",
+        "earthquake", "hurricane", "weather", "temperature", "carbon",
+    ],
+    "world": [
+        "war", "ukraine", "russia", "china", "nato", "military", "invasion",
+        "ceasefire", "sanctions", "nuclear", "missile", "un ", "united nations",
+        "refugee", "border", "coup", "protest", "treaty", "diplomacy",
+    ],
+    "entertainment": [
+        "oscar", "emmy", "grammy", "box office", "movie", "film", "netflix",
+        "disney", "spotify", "album", "concert", "celebrity", "tv show",
+        "streaming", "music", "award", "billboard",
+    ],
 }
+
+# Sports keywords to EXCLUDE
+SPORTS_KEYWORDS_EXCLUDE = [
+    "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball",
+    "hockey", "tennis", "golf", "ufc", "mma", "boxing", "olympics", "fifa",
+    "world cup", "super bowl", "playoff", "championship", "match", "game score",
+    "touchdown", "goal scorer", "mvp", "draft pick",
+]
 
 
 @dataclass
@@ -138,7 +175,7 @@ class PolymarketTracker:
         self._signal_cooldown = 300  # 5 min cooldown per market
         # Exit strategy
         self.open_positions: dict[str, OpenPosition] = {}  # kalshi ticker → position
-        self._price_target_cents = 0.25  # exit when price moves 25 cents in our favor
+        self._price_target_pct = 0.69  # exit when price moves 69% above entry
         self.stats = {
             "polls": 0,
             "trades_seen": 0,
@@ -157,8 +194,11 @@ class PolymarketTracker:
 
     @staticmethod
     def _detect_sector(title: str) -> str | None:
-        """Check if a market title belongs to a tracked sector."""
+        """Check if a market title belongs to a tracked sector. Excludes sports."""
         lower = title.lower()
+        # Reject sports
+        if any(kw in lower for kw in SPORTS_KEYWORDS_EXCLUDE):
+            return None
         for sector, keywords in SECTOR_KEYWORDS.items():
             if any(kw in lower for kw in keywords):
                 return sector
@@ -308,12 +348,12 @@ class PolymarketTracker:
                 best_score = score
                 best_match = market
 
-        # Need at least 45% keyword overlap to match cross-platform
-        if best_score >= 0.45 and best_match:
+        # Need at least 30% keyword overlap to match cross-platform
+        if best_score >= 0.30 and best_match:
             return best_match
         return None
 
-    def _score_alert(self, trade: WhaleTrade, profile: WalletProfile, pattern: str | None) -> int:
+    def _score_alert(self, trade: WhaleTrade, profile: WalletProfile, pattern: str | None, wallet_stats: WalletStats | None = None) -> int:
         """Score the alert 0-100. Higher = more actionable."""
         score = 0
 
@@ -349,7 +389,16 @@ class PolymarketTracker:
         if trade.side == "BUY" and trade.outcome.lower() == "no":
             score += 10
 
-        return min(score, 100)
+        # Wallet win rate bonus/penalty (up to +20 / -20)
+        if wallet_stats and wallet_stats.is_reliable:
+            if wallet_stats.win_rate >= 0.65:
+                score += 20  # Sharp whale
+            elif wallet_stats.win_rate >= 0.55:
+                score += 10  # Good whale
+            elif wallet_stats.win_rate < 0.35:
+                score -= 20  # Consistently wrong — fade candidate
+
+        return max(0, min(score, 100))
 
     def _check_exit_reversal(self, trade: WhaleTrade) -> OpenPosition | None:
         """Exit 1: The same wallet that triggered our entry now bets the opposite way."""
@@ -399,7 +448,9 @@ class PolymarketTracker:
             else:
                 profit = pos.entry_price - current_price
 
-            if profit >= self._price_target_cents:
+            # Proportionate target: 39% of entry price
+            target = pos.entry_price * self._price_target_pct
+            if profit >= target:
                 exits.append(pos)
         return exits
 
@@ -450,12 +501,27 @@ class PolymarketTracker:
             for trade in trades:
                 self.stats["trades_seen"] += 1
 
-                # Filter to tracked sectors only
-                sector = self._detect_sector(trade.market_title)
-                if not sector:
-                    continue
+                # Check if this is a followed wallet (auto-trade all their non-sports trades)
+                followed = is_followed(trade.wallet, trade.name)
+
+                # Sports exclusion — applies to both followed and regular paths
+                title_lower = trade.market_title.lower()
+                is_sports = any(kw in title_lower for kw in SPORTS_KEYWORDS_EXCLUDE)
+
+                if followed:
+                    if is_sports:
+                        continue  # Sports excluded even for followed wallets
+                    sector = self._detect_sector(trade.market_title) or "followed"
+                else:
+                    # Regular path: must match a tracked sector
+                    sector = self._detect_sector(trade.market_title)
+                    if not sector:
+                        continue
 
                 self.stats["whales_detected"] += 1
+                if followed:
+                    self.stats.setdefault("followed_trades", 0)
+                    self.stats["followed_trades"] += 1
 
                 # --- EXIT CHECK 1: Whale reversal (same wallet flips) ---
                 rev_pos = self._check_exit_reversal(trade)
@@ -468,16 +534,22 @@ class PolymarketTracker:
                 if profile.is_repeat:
                     self.stats["repeat_whales"] += 1
 
+                # Fetch wallet win rate from Polymarket
+                wallet_stats: WalletStats = await get_wallet_stats(trade.wallet, trade.name)
+
                 # Detect pattern
                 pattern = self._detect_pattern(trade, profile)
 
-                # Score
-                score = self._score_alert(trade, profile, pattern)
+                # Score — followed wallets get max score (100) to bypass thresholds
+                score = self._score_alert(trade, profile, pattern, wallet_stats)
+                if followed:
+                    score = 100
 
                 # Display
-                tier_color = "bright_red" if score >= 60 else ("bright_yellow" if score >= 35 else "dim")
-                tier = "HIGH" if score >= 60 else ("MED" if score >= 35 else "LOW")
+                tier_color = "bright_magenta" if followed else ("bright_red" if score >= 60 else ("bright_yellow" if score >= 35 else "dim"))
+                tier = "FOLLOWED" if followed else ("HIGH" if score >= 60 else ("MED" if score >= 35 else "LOW"))
                 pattern_str = f" [{pattern}]" if pattern else ""
+                wr_str = f" WR:{wallet_stats.win_rate_pct:.0f}%({wallet_stats.tier})" if wallet_stats.is_reliable else ""
 
                 sector_color = "bright_cyan" if sector == "crypto" else "bright_blue"
                 _console.print(
@@ -486,7 +558,7 @@ class PolymarketTracker:
                     f"${trade.size:,.0f} {trade.side} {trade.outcome} "
                     f"@{trade.price:.2f}{pattern_str} "
                     f"by {trade.name[:15]} "
-                    f"(score:{score}) "
+                    f"(score:{score}{wr_str}) "
                     f"\"{trade.market_title[:40]}...\""
                 )
 
@@ -506,6 +578,20 @@ class PolymarketTracker:
                 }
                 self.recent_alerts.append(alert)
                 self.recent_alerts = self.recent_alerts[-100:]
+
+                # Telegram notification (non-sports only, handled inside)
+                wr_tg = f" | WR:{wallet_stats.win_rate_pct:.0f}%({wallet_stats.tier})" if wallet_stats.is_reliable else ""
+                followed_tg = "⭐ FOLLOWED | " if followed else ""
+                asyncio.create_task(send_whale_alert(
+                    source="Polymarket",
+                    title=trade.market_title,
+                    side=f"{trade.side} {trade.outcome}",
+                    value=trade.size,
+                    price=trade.price,
+                    username=trade.name,
+                    extra=f"{followed_tg}score:{score}{pattern_str}{wr_tg}",
+                    force=followed,
+                ))
 
                 # Log to DB
                 db_logger.log_flow_alert(
@@ -542,6 +628,20 @@ class PolymarketTracker:
                             self._recent_signals[kalshi_market.condition_id] = now
 
                             side = "YES" if trade.direction == "bullish" else "NO"
+
+                            # Fade logic: if wallet is a consistent loser, bet opposite
+                            # (Skipped for followed wallets — we trust them by definition)
+                            wallet_mult = wallet_stats.bet_multiplier if wallet_stats else 1.0
+                            if followed:
+                                wallet_mult = 2.0  # Max bet for followed wallets
+                            elif wallet_mult < 0:
+                                side = "NO" if side == "YES" else "YES"
+                                _console.print(
+                                    f"    [bright_magenta]→ FADE:[/bright_magenta] "
+                                    f"wallet WR {wallet_stats.win_rate_pct:.0f}% — betting OPPOSITE ({side})"
+                                )
+                                wallet_mult = abs(wallet_mult)
+
                             self.stats["signals_emitted"] += 1
                             self.signal_queue.put_nowait({
                                 "type": "poly_whale",
@@ -552,6 +652,10 @@ class PolymarketTracker:
                                 "pattern": pattern,
                                 "wallet_name": trade.name,
                                 "poly_price": trade.price,
+                                "wallet_win_rate": wallet_stats.win_rate_pct if wallet_stats else -1,
+                                "wallet_tier": "followed" if followed else (wallet_stats.tier if wallet_stats else "unknown"),
+                                "wallet_multiplier": wallet_mult,
+                                "followed": followed,
                             })
                             # Track open position for exit strategy
                             bet_frac = min((score - 30) / 70.0, 1.0)
