@@ -49,6 +49,11 @@ class KalshiTrade:
         return self.yes_price
 
     @property
+    def side_price(self) -> float:
+        """Price of the side the taker bought (0-1 range)."""
+        return self.yes_price if self.taker_side == "yes" else 1.0 - self.yes_price
+
+    @property
     def value_usd(self) -> float:
         """Trade value in USD = price × count."""
         price = self.price_dollars
@@ -129,7 +134,7 @@ class MarketWatcher:
             return
 
         # Skip contracts with no upside — too cheap or too expensive
-        if trade.price_dollars > 0.85 or trade.price_dollars < 0.05:
+        if trade.side_price > 0.85 or trade.side_price < 0.05:
             return
 
         # Look up market title — fetch on-the-fly if unknown
@@ -158,7 +163,7 @@ class MarketWatcher:
             _console.print(
                 f"  [{ts}] [{color}][{tier}][/{color}] "
                 f"${value:,.0f} {trade.side_label} "
-                f"({trade.count} contracts @${trade.price_dollars:.2f}) "
+                f"({trade.count} contracts @${trade.side_price:.2f}) "
                 f"\"{trade.market_title[:45]}\"{oi_str} "
                 f"[{source}]"
             )
@@ -169,7 +174,7 @@ class MarketWatcher:
                 market_question=trade.market_title[:100],
                 side=trade.side_label,
                 size=value,
-                price=trade.price_dollars,
+                price=trade.side_price,
                 avg_size=0,
                 multiple=value / WHALE_ALERT_USD,
                 market_price=market.yes_price if market else trade.price_dollars,
@@ -180,7 +185,7 @@ class MarketWatcher:
                 "question": trade.market_title,
                 "side": trade.side_label,
                 "size": value,
-                "price": trade.price_dollars,
+                "price": trade.side_price,
                 "count": trade.count,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -195,7 +200,7 @@ class MarketWatcher:
                 title=trade.market_title,
                 side=trade.side_label,
                 value=value,
-                price=trade.price_dollars,
+                price=trade.side_price,
                 count=trade.count,
                 sports=is_sports,
             ))
@@ -224,7 +229,7 @@ class MarketWatcher:
                     "market": market,
                     "side": trade.side_label,
                     "size": value,
-                    "price": trade.price_dollars,
+                    "price": trade.side_price,
                     "multiple": value / WHALE_ALERT_USD,
                     "count": trade.count,
                     "cluster_count": cluster_count,
@@ -236,7 +241,7 @@ class MarketWatcher:
             # Log smaller notable trades dimly
             _console.print(
                 f"  [dim][trade] ${value:,.0f} {trade.side_label} "
-                f"({trade.count}@${trade.price_dollars:.2f}) "
+                f"({trade.count}@${trade.side_price:.2f}) "
                 f"\"{trade.market_title[:40]}\" [{source}][/dim]"
             )
 
@@ -335,7 +340,7 @@ class MarketWatcher:
                 count=int(count),
                 yes_price=yes_p,  # already in dollars (0-1)
                 no_price=no_p,
-                taker_side=t.get("taker_side", "yes"),
+                taker_side=t.get("taker_outcome_side") or t.get("taker_side", "yes"),  # taker_side is deprecated
                 created_time=t.get("ts", t.get("created_time", "")),
             )
         except (ValueError, TypeError):

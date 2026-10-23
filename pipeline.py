@@ -81,6 +81,9 @@ class PipelineV4:
         console.print(f"  Max bet: ${config.MAX_BET_USD:.0f} (${config.MAX_BET_SPORTS_USD:.0f} sports) | Daily limit: ${config.DAILY_LOSS_LIMIT_USD:.0f}")
         console.print()
 
+        if not config.DRY_RUN:
+            self._warn_unfunded_shards()
+
         # Check existing holdings for positions above sell threshold
         await self._check_holdings_on_startup()
 
@@ -95,6 +98,23 @@ class PipelineV4:
             )
         except asyncio.CancelledError:
             self.running = False
+
+    @staticmethod
+    def _warn_unfunded_shards():
+        """Kalshi splits markets across exchange shards, and API orders don't move cash between them."""
+        from executor import shard_balances
+        try:
+            low = {i: b for i, b in sorted(shard_balances().items()) if b < config.MAX_BET_USD}
+        except Exception as e:
+            console.print(f"  [yellow]Couldn't check Kalshi balances: {escape(str(e))}[/yellow]")
+            return
+        if low:
+            shards = ", ".join(f"shard {i} ${b:.2f}" for i, b in low.items())
+            console.print(
+                f"  [bold yellow]Kalshi cash below the ${config.MAX_BET_USD:.0f} max bet on {shards}. "
+                f"Orders on markets traded there will be rejected. Move cash at "
+                f"kalshi.com/account/exchange-indexes or set up auto-rebalancing.[/bold yellow]"
+            )
 
     async def _supervise(self, name: str, task_fn):
         """Run a pipeline task; if it crashes, report it and start it again."""
@@ -357,6 +377,7 @@ class PipelineV4:
             side=exit_side,
             bet_amount=existing.bet_amount,  # exit same size as entry
             reasoning=f"EXIT: {new_cls.reasoning}",
+            is_exit=True,
             headlines=event.headline,
             news_source=event.source,
             classification=new_cls.direction,
@@ -455,6 +476,7 @@ class PipelineV4:
                         side="YES",
                         bet_amount=0,  # sell all
                         reasoning=f"EXIT: startup_check — price ${current_price:.2f} above threshold",
+                        is_exit=True,
                         headlines=f"Startup exit: {title}",
                         news_source="startup",
                         classification="exit",
@@ -508,6 +530,7 @@ class PipelineV4:
                     side=side,
                     bet_amount=bet_amount,
                     reasoning=f"EXIT: {pattern} on {market.question[:40]}",
+                    is_exit=True,
                     headlines=f"Exit: {pattern}",
                     news_source="polymarket",
                     classification="exit",
@@ -640,7 +663,7 @@ class PipelineV4:
                 kalshi_market=market,
                 poly_condition_id="",
                 side=side,
-                entry_price=price,
+                entry_price=price if side == "YES" else 1.0 - price,  # YES leg, as the take-profit check expects
                 bet_amount=bet_amount,
                 entry_time=_time.time(),
                 entry_wallet="kalshi_flow",
@@ -672,11 +695,13 @@ class PipelineV4:
 
             status = result["status"]
             side = result["side"]
-            is_exit = "EXIT" in (signal.reasoning or "")
+            is_exit = signal.is_exit
             src = signal.news_source or "—"
 
             if status == "filled":
                 status_str = "[bold bright_white on green] FILLED [/bold bright_white on green]"
+            elif status == "partial":
+                status_str = "[bold bright_white on green] PARTIAL [/bold bright_white on green]"
             elif status == "cancelled":
                 status_str = "[bold white on red] CANCELLED [/bold white on red]"
             elif status == "dry_run":
@@ -706,6 +731,8 @@ class PipelineV4:
                 f"source: [bold]{src}[/bold] | "
                 f"{signal.reasoning[:60] if signal.reasoning else ''}"
             )
+            if result.get("detail"):
+                console.print(f"    {escape(result['detail'][:200])}")
             console.print()
 
     async def _status_printer(self):

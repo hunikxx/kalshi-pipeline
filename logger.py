@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "trades.db"
+DB_PATH = Path(os.getenv("TRADES_DB") or Path(__file__).parent / "trades.db")  # override for tests
 
 
 def _conn() -> sqlite3.Connection:
@@ -112,6 +113,7 @@ def _migrate_v4_columns(conn):
         ("news_latency_ms", "INTEGER"),
         ("classification_latency_ms", "INTEGER"),
         ("total_latency_ms", "INTEGER"),
+        ("detail", "TEXT"),  # fill summary or error body
     ]
     for col_name, col_type in new_cols:
         if col_name not in columns:
@@ -137,6 +139,7 @@ def log_trade(
     news_latency_ms: int | None = None,
     classification_latency_ms: int | None = None,
     total_latency_ms: int | None = None,
+    detail: str = "",
 ) -> int:
     conn = _conn()
     cur = conn.execute(
@@ -144,12 +147,12 @@ def log_trade(
            (market_id, market_question, claude_score, market_price, edge,
             side, amount_usd, order_id, status, reasoning, headlines,
             news_source, classification, materiality,
-            news_latency_ms, classification_latency_ms, total_latency_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            news_latency_ms, classification_latency_ms, total_latency_ms, detail)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (market_id, market_question, claude_score, market_price, edge,
          side, amount_usd, order_id, status, reasoning, headlines,
          news_source, classification, materiality,
-         news_latency_ms, classification_latency_ms, total_latency_ms),
+         news_latency_ms, classification_latency_ms, total_latency_ms, detail),
     )
     trade_id = cur.lastrowid
     conn.commit()
@@ -264,7 +267,7 @@ def get_daily_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     row = conn.execute(
         """SELECT COALESCE(SUM(
-               CASE WHEN status IN ('filled','executed') THEN -amount_usd ELSE 0 END
+               CASE WHEN status IN ('filled','executed','partial','unknown') THEN -amount_usd ELSE 0 END
            ), 0) as spent
            FROM trades WHERE created_at LIKE ?""",
         (f"{today}%",),
@@ -298,7 +301,7 @@ def get_trade_stats() -> dict:
         "SELECT status, COUNT(*) as c FROM trades GROUP BY status"
     ).fetchall()
     total_wagered = conn.execute(
-        "SELECT COALESCE(SUM(amount_usd), 0) as s FROM trades WHERE status IN ('executed', 'filled')"
+        "SELECT COALESCE(SUM(amount_usd), 0) as s FROM trades WHERE status IN ('executed', 'filled', 'partial')"
     ).fetchone()["s"]
     conn.close()
     return {

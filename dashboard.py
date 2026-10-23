@@ -27,8 +27,7 @@ def _is_live_mode() -> bool:
     trades = logger.get_recent_trades(limit=5)
     if not trades:
         return not config.DRY_RUN
-    return any(t["status"] in ("filled", "placed", "rejected_daily_limit") or
-               t["status"].startswith("error_http") for t in trades)
+    return any(t["status"] != "dry_run" for t in trades)
 
 console = Console()
 
@@ -148,6 +147,7 @@ def render_performance() -> Panel:
     by_status = stats["by_status"]
     dry_runs = by_status.get("dry_run", 0)
     filled = by_status.get("filled", 0)
+    partial = by_status.get("partial", 0)
     placed = by_status.get("placed", 0)
     errors = sum(v for k, v in by_status.items() if k.startswith("error"))
 
@@ -171,6 +171,8 @@ def render_performance() -> Panel:
     table.add_row("Dry Runs", f"[{WARN}]{dry_runs}[/{WARN}]")
     cancelled = by_status.get("cancelled", 0)
     table.add_row("Filled", f"[{WIN}]{filled}[/{WIN}]")
+    if partial:
+        table.add_row("Partly filled", f"[{WIN}]{partial}[/{WIN}]")
     table.add_row("Cancelled", f"[{LOSS}]{cancelled}[/{LOSS}]")
     if errors:
         table.add_row("Errors", f"[{LOSS}]{errors}[/{LOSS}]")
@@ -356,6 +358,8 @@ def render_trades() -> Panel:
                 status_str = f"[{WARN}]DRY RUN[/{WARN}]"
             elif status == "filled":
                 status_str = f"[{WIN}]FILLED[/{WIN}]"
+            elif status == "partial":
+                status_str = f"[{WIN}]PARTIAL[/{WIN}]"
             elif status == "cancelled":
                 status_str = f"[{LOSS}]CANCEL[/{LOSS}]"
             elif status.startswith("error"):

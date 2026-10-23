@@ -25,7 +25,8 @@ class Signal:
     news_latency_ms: int = 0
     classification_latency_ms: int = 0
     total_latency_ms: int = 0
-    limit_price: float = 0.0  # whale price + 1¢ (0 = use market price)
+    limit_price: float = 0.0  # price of the side being bought, e.g. the whale's (0 = use market price)
+    is_exit: bool = False  # sell the position held in this market
 
 
 def detect_edge(
