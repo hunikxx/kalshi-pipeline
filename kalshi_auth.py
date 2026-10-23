@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import base64
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import config
 
 
+@lru_cache(maxsize=1)
 def _load_private_key():
-    """Load RSA private key from PEM file."""
+    """Load RSA private key from PEM file (once; parsing it takes ~70ms)."""
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
     key_path = config.KALSHI_PRIVATE_KEY_PATH

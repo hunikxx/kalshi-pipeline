@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from telegram_notifier import send_whale_alert
 from wallet_scorer import get_wallet_stats, WalletStats
 from followed import is_followed
+import sports
 from difflib import SequenceMatcher
 
 import httpx
@@ -74,14 +75,6 @@ SECTOR_KEYWORDS = {
     ],
 }
 
-# Sports keywords to EXCLUDE
-SPORTS_KEYWORDS_EXCLUDE = [
-    "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball",
-    "hockey", "tennis", "golf", "ufc", "mma", "boxing", "olympics", "fifa",
-    "world cup", "super bowl", "playoff", "championship", "match", "game score",
-    "touchdown", "goal scorer", "mvp", "draft pick",
-]
-
 
 @dataclass
 class WhaleTrade:
@@ -96,6 +89,8 @@ class WhaleTrade:
     price: float
     timestamp: int
     tx_hash: str = ""
+    event_slug: str = ""
+    market_slug: str = ""
 
     @property
     def direction(self) -> str:
@@ -196,11 +191,8 @@ class PolymarketTracker:
 
     @staticmethod
     def _detect_sector(title: str) -> str | None:
-        """Check if a market title belongs to a tracked sector. Excludes sports."""
+        """Check if a market title belongs to a tracked sector."""
         lower = title.lower()
-        # Reject sports
-        if any(kw in lower for kw in SPORTS_KEYWORDS_EXCLUDE):
-            return None
         for sector, keywords in SECTOR_KEYWORDS.items():
             if any(kw in lower for kw in keywords):
                 return sector
@@ -257,10 +249,12 @@ class PolymarketTracker:
                     condition_id=t.get("condition_id", ""),
                     outcome=t.get("outcome", ""),
                     side=t.get("side", ""),
-                    size=float(t.get("size", 0)),
+                    size=float(t.get("size", 0)) * trade_price,  # the API's size is shares
                     price=trade_price,
                     timestamp=int(t.get("timestamp", time.time())),
                     tx_hash=tx,
+                    event_slug=t.get("event_slug", ""),
+                    market_slug=t.get("slug", ""),
                 )
                 trades.append(trade)
                 self._seen_tx.add(tx)
@@ -518,12 +512,10 @@ class PolymarketTracker:
                 followed = is_followed(trade.wallet, trade.name)
 
                 # Sports exclusion — applies to both followed and regular paths
-                title_lower = trade.market_title.lower()
-                is_sports = any(kw in title_lower for kw in SPORTS_KEYWORDS_EXCLUDE)
+                if await sports.polymarket_is_sports(trade.event_slug, trade.market_slug):
+                    continue
 
                 if followed:
-                    if is_sports:
-                        continue  # Sports excluded even for followed wallets
                     sector = self._detect_sector(trade.market_title) or "followed"
                 else:
                     # Regular path: must match a tracked sector
@@ -627,6 +619,9 @@ class PolymarketTracker:
                 # Match to Kalshi and emit signal
                 if score >= 35:
                     kalshi_market = self._match_to_kalshi(trade.market_title)
+                    if kalshi_market and sports.kalshi_is_sports(kalshi_market.condition_id, kalshi_market.legs):
+                        _console.print(f"    [dim]→ skipped (matched Kalshi market is sports: {kalshi_market.condition_id})[/dim]")
+                        continue
                     if kalshi_market:
                         self.stats["kalshi_matches"] += 1
                         _console.print(
@@ -636,6 +631,11 @@ class PolymarketTracker:
                         )
 
                         if self.signal_queue and score >= 30:
+                            # Outcomes other than Yes/No (Up/Down, Over/Under, team names) have no YES/NO side
+                            if trade.direction == "unknown":
+                                _console.print(f"    [dim]→ skipped (outcome {trade.outcome!r} has no YES/NO direction)[/dim]")
+                                continue
+
                             # Cooldown: one signal per market per 5 min
                             now = time.time()
                             last = self._recent_signals.get(kalshi_market.condition_id, 0)

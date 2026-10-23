@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
 
 import config
 from kalshi_auth import auth_headers
+import sports
 from rich.console import Console
 
 _console = Console()
@@ -27,6 +28,7 @@ class Market:
     event_ticker: str = ""
     liquidity: float = 0.0
     open_interest: float = 0.0
+    legs: list[str] = field(default_factory=list)  # leg market tickers, for combo markets
 
     @property
     def implied_probability(self) -> float:
@@ -91,6 +93,7 @@ def fetch_active_markets(limit: int = 500) -> list[Market]:
         # Extract nested markets from each event
         for event in events:
             event_category = event.get("category", "")
+            sports.note_kalshi_series(event.get("series_ticker", ""), event_category)
             for m in event.get("markets", []):
                 try:
                     ticker = m.get("ticker", "")
@@ -174,6 +177,8 @@ def fetch_market_by_ticker(ticker: str) -> Market | None:
 
     last_price = float(m.get("last_price_dollars", 0) or 0)
     yes_price = last_price if last_price > 0 else 0.5
+    legs = [leg.get("market_ticker", "") for leg in m.get("mve_selected_legs") or []]
+    sports.ensure_kalshi_series([m.get("ticker", ticker)] + legs)
 
     return Market(
         condition_id=m.get("ticker", ticker),
@@ -191,6 +196,7 @@ def fetch_market_by_ticker(ticker: str) -> Market | None:
         event_ticker=m.get("event_ticker", ""),
         liquidity=float(m.get("liquidity_dollars", 0) or 0),
         open_interest=float(m.get("open_interest", 0) or 0),
+        legs=legs,
     )
 
 

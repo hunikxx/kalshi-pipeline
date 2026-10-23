@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+import sports
 from telegram_notifier import send_whale_alert
 
 import httpx
@@ -28,14 +29,6 @@ log = logging.getLogger(__name__)
 
 WHALE_THRESHOLD_USD = 5000  # minimum trade value to display (dim)
 WHALE_ALERT_USD = 5000  # threshold for whale alert + auto-trade (non-sports only)
-SPORTS_KEYWORDS = {
-    "GAME", "NBA", "NFL", "NHL", "MLB", "PGA", "UFC", "MMA", "SOCCER", "EPL",
-    "FIFA", "UCL", "LALIGA", "BUNDES", "SERIE", "LIGUE", "IPL", "T20", "CWC",
-    "NASCAR", "MOTO", "SGP", "NBASGP", "F1", "ATP", "WTA", "MASTERS", "WCUP",
-    "WORLDCUP", "CRICKET", "TENNIS", "GOLF", "BOXING",
-    # Match-outcome / advance-style keywords in ticker
-    "ADVANCE", "MATCH", "PLAYOFF", "FINAL", "SEMI", "QUARTER",
-}
 
 
 @dataclass
@@ -78,6 +71,7 @@ class MarketWatcher:
         self._refresh_interval = 300
         self._ws_connected = False
         self._seen_trade_ids: set[str] = set()
+        self._last_ws_error_log = 0.0
         self._http_poll_interval = 10  # seconds between HTTP polls
         self.flow_alerts: list[dict] = []
         self._whale_cluster: dict[str, list[float]] = {}  # ticker → [timestamps]
@@ -88,11 +82,13 @@ class MarketWatcher:
             "http_trades": 0,
             "market_refreshes": 0,
             "whales_detected": 0,
+            "ws_errors": 0,
         }
 
     async def refresh_markets(self):
         """Fetch all markets from Kalshi API."""
         try:
+            await asyncio.get_event_loop().run_in_executor(None, sports.refresh_kalshi_series)
             all_markets = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: fetch_active_markets(limit=1000)
             )
@@ -128,6 +124,14 @@ class MarketWatcher:
         else:
             self.stats["http_trades"] += 1
 
+        # Skip small trades
+        if value < WHALE_THRESHOLD_USD:
+            return
+
+        # Skip contracts with no upside — too cheap or too expensive
+        if trade.price_dollars > 0.85 or trade.price_dollars < 0.05:
+            return
+
         # Look up market title — fetch on-the-fly if unknown
         market = self._market_lookup.get(trade.ticker)
         if not market and trade.ticker:
@@ -143,14 +147,6 @@ class MarketWatcher:
             trade.market_title = market.question
         else:
             trade.market_title = trade.ticker
-
-        # Skip small trades
-        if value < WHALE_THRESHOLD_USD:
-            return
-
-        # Skip contracts with no upside — too cheap or too expensive
-        if trade.price_dollars > 0.85 or trade.price_dollars < 0.05:
-            return
 
         # Display all trades above threshold (unified for all categories)
         if value >= WHALE_ALERT_USD:
@@ -191,7 +187,9 @@ class MarketWatcher:
             self.flow_alerts.append(alert)
             self.flow_alerts = self.flow_alerts[-50:]
 
-            # Telegram notification (non-sports only, handled inside)
+            is_sports = sports.kalshi_is_sports(trade.ticker, market.legs if market else ())
+
+            # Telegram notification (sports use a higher threshold, handled inside)
             asyncio.create_task(send_whale_alert(
                 source="Kalshi",
                 title=trade.market_title,
@@ -199,8 +197,7 @@ class MarketWatcher:
                 value=value,
                 price=trade.price_dollars,
                 count=trade.count,
-                ticker=trade.ticker,
-                category=market.category if market else "",
+                sports=is_sports,
             ))
 
             # Track whale clustering — how many whales on this ticker in last 10 min
@@ -221,13 +218,6 @@ class MarketWatcher:
                 )
 
             # Emit trade signal for auto-trading (skip sports)
-            # Use the same title-based detector as Telegram for consistent coverage
-            from telegram_notifier import _is_sports as _title_is_sports
-            is_sports = (
-                any(kw in trade.ticker.upper() for kw in SPORTS_KEYWORDS)
-                or (market and market.category.lower() in ("sports",))
-                or _title_is_sports(trade.market_title or "", ticker=trade.ticker, category=(market.category if market else ""))
-            )
             if market and self.signal_queue and not is_sports:
                 self.signal_queue.put_nowait({
                     "type": "flow_signal",
@@ -295,8 +285,12 @@ class MarketWatcher:
                         try:
                             data = json.loads(msg)
                             await self._handle_trade_message(data)
-                        except Exception as parse_err:
-                            log.debug(f"trade parse error: {parse_err}")
+                        except Exception:
+                            self.stats["ws_errors"] += 1
+                            # A bug here would silently drop every whale, so surface it (rate-limited)
+                            if time.time() - self._last_ws_error_log > 60:
+                                self._last_ws_error_log = time.time()
+                                log.warning(f"trade message error ({self.stats['ws_errors']} so far)", exc_info=True)
                             continue
 
             except Exception as e:

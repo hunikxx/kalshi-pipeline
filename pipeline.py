@@ -7,11 +7,13 @@ V4: News stream → Match → Classify → Edge → Trade (event-driven)
 from __future__ import annotations
 
 import asyncio
+import html
 import time
 import logging
 from collections import OrderedDict
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from rich.panel import Panel
 
@@ -27,6 +29,8 @@ from market_watcher import MarketWatcher
 from matcher import match_news_to_markets, match_news_to_markets_broad
 from classifier import classify_async
 from polymarket_tracker import PolymarketTracker
+from telegram_notifier import send_text
+import sports
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -82,16 +86,40 @@ class PipelineV4:
 
         try:
             await asyncio.gather(
-                self.market_watcher.run(),           # Kalshi markets + WebSocket trade feed
-                self._process_flow_signals(),        # Kalshi whale trades → auto-trade
-                self._wait_then_start_poly(),        # Polymarket whale tracking → trade on Kalshi
-                self._process_poly_signals(),        # Polymarket whales → signals
-                self._execute_signals(),
-                self._status_printer(),
-                return_exceptions=True,
+                self._supervise("market watcher", self.market_watcher.run),           # Kalshi markets + WebSocket trade feed
+                self._supervise("Kalshi whale signals", self._process_flow_signals),  # Kalshi whale trades → auto-trade
+                self._supervise("Polymarket tracker", self._wait_then_start_poly),    # Polymarket whale tracking → trade on Kalshi
+                self._supervise("Polymarket signals", self._process_poly_signals),    # Polymarket whales → signals
+                self._supervise("order executor", self._execute_signals),
+                self._supervise("status printer", self._status_printer),
             )
         except asyncio.CancelledError:
             self.running = False
+
+    async def _supervise(self, name: str, task_fn):
+        """Run a pipeline task; if it crashes, report it and start it again."""
+        delay = 2
+        last_alert = 0.0
+        while True:
+            started = time.time()
+            try:
+                return await task_fn()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if time.time() - started > 300:
+                    delay = 2  # it had been healthy for a while, so retry quickly
+                log.exception(f"{name} crashed")
+                console.print(f"  [bold red]{escape(name)} crashed: {escape(f'{type(e).__name__}: {e}')} — restarting in {delay}s[/bold red]")
+                if time.time() - last_alert > 600:
+                    last_alert = time.time()
+                    await send_text(
+                        f"⚠️ <b>Bot task crashed: {name}</b>\n"
+                        f"{html.escape(f'{type(e).__name__}: {e}')[:300]}\n"
+                        f"Restarting in {delay}s"
+                    )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
 
     # ------------------------------------------------------------------
     # Stage 1: Collect news into buffer
@@ -497,16 +525,13 @@ class PipelineV4:
                 )
             else:
                 # Buy: scale bet by score, then apply wallet multiplier
-                # Sports markets capped at MAX_BET_SPORTS_USD
-                from telegram_notifier import _is_sports
-                max_bet = config.MAX_BET_SPORTS_USD if _is_sports(
-                    market.question,
-                    ticker=getattr(market, "condition_id", ""),
-                    category=getattr(market, "category", ""),
+                # Sports markets capped at MAX_BET_SPORTS_USD (the tracker already skips them)
+                max_bet = config.MAX_BET_SPORTS_USD if sports.kalshi_is_sports(
+                    market.condition_id, market.legs
                 ) else config.MAX_BET_USD
                 bet_frac = min((score - 30) / 70.0, 1.0)
                 wallet_mult = sig.get("wallet_multiplier", 1.0)
-                bet_amount = round(max(1.0, max_bet * bet_frac * wallet_mult), 2)
+                bet_amount = round(max(1.0, min(max_bet, max_bet * bet_frac * wallet_mult)), 2)
                 edge = min(score / 100.0 * 0.3, 0.30)
 
                 wr = sig.get("wallet_win_rate", -1)
@@ -620,6 +645,7 @@ class PipelineV4:
                 entry_time=_time.time(),
                 entry_wallet="kalshi_flow",
                 entry_score=int(oi_ratio * 100),
+                poly_title=market.question,
             )
             self.poly_tracker.open_positions[market.condition_id] = pos
 
