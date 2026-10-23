@@ -29,8 +29,9 @@ from rich.console import Console
 log = logging.getLogger(__name__)
 _console = Console()
 
-TRADES_URL = "https://data-api.polymarket.com/trades"
+TRADES_URL = "https://data-api.polymarket.com/v2/trades"
 POLL_INTERVAL = 5  # seconds between polls (speed premium)
+MAX_TRADE_AGE_SECONDS = 60  # older trades (restart backlog, feed lag) have no edge left
 
 # Only track whales in these sectors
 TRACKED_SECTORS = {"politics", "crypto", "economy", "ai_tech", "science", "world", "entertainment"}
@@ -166,6 +167,7 @@ class PolymarketTracker:
     def __init__(self, min_trade_usd: int = 25_000):
         self.min_trade_usd = min_trade_usd
         self._seen_tx: set[str] = set()  # tx hashes already processed
+        self._primed = False  # first successful poll only records what is already in the feed
         self._wallets: dict[str, WalletProfile] = {}  # hash → profile
         self._market_cache: dict[str, str] = {}  # poly condition_id → kalshi ticker
         self.signal_queue: asyncio.Queue | None = None
@@ -212,22 +214,32 @@ class PolymarketTracker:
                     TRADES_URL,
                     params={
                         "limit": "100",
-                        "filterType": "CASH",
-                        "filterAmount": str(self.min_trade_usd),
-                        "takerOnly": "true",
+                        "filter_type": "CASH",
+                        "filter_amount": str(self.min_trade_usd),
+                        "taker_only": "true",
+                        # The feed sits behind a 300s CDN cache; a unique param forces a fresh read
+                        "_cb": str(time.time_ns()),
                     },
                     timeout=15,
                 )
                 resp.raise_for_status()
-                raw = resp.json()
+                raw = resp.json().get("data") or []
+
+            if not self._primed:
+                # Startup: these trades predate this run, and a previous run may already have
+                # acted on them, so record them as seen without trading
+                self._primed = True
+                self._seen_tx.update(t.get("transaction_hash", "") for t in raw)
+                _console.print(f"  [dim][poly] startup: {len(raw)} recent trades marked seen, not traded[/dim]")
+                return []
 
             trades = []
             for t in raw:
-                tx = t.get("transactionHash", "")
+                tx = t.get("transaction_hash", "")
                 if tx in self._seen_tx:
                     continue
 
-                wallet = t.get("proxyWallet", "")
+                wallet = t.get("proxy_wallet", "")
                 if not wallet:
                     continue
 
@@ -242,7 +254,7 @@ class PolymarketTracker:
                     wallet_hash=self._hash_wallet(wallet),
                     name=t.get("name", "") or t.get("pseudonym", "") or wallet[:10],
                     market_title=t.get("title", ""),
-                    condition_id=t.get("conditionId", ""),
+                    condition_id=t.get("condition_id", ""),
                     outcome=t.get("outcome", ""),
                     side=t.get("side", ""),
                     size=float(t.get("size", 0)),
@@ -497,6 +509,7 @@ class PolymarketTracker:
         while True:
             trades = await self._fetch_trades()
             self.stats["polls"] += 1
+            stale = 0
 
             for trade in trades:
                 self.stats["trades_seen"] += 1
@@ -533,6 +546,12 @@ class PolymarketTracker:
                 profile = self._track_wallet(trade)
                 if profile.is_repeat:
                     self.stats["repeat_whales"] += 1
+
+                # A stale trade still counts for the exit check and wallet history above,
+                # but is too old to alert or trade on
+                if trade.age_seconds > MAX_TRADE_AGE_SECONDS:
+                    stale += 1
+                    continue
 
                 # Fetch wallet win rate from Polymarket
                 wallet_stats: WalletStats = await get_wallet_stats(trade.wallet, trade.name)
@@ -678,6 +697,9 @@ class PolymarketTracker:
                                 f"score:{score} ${trade.size:,.0f} whale "
                                 f"→ Kalshi \"{kalshi_market.question[:40]}...\""
                             )
+
+            if stale:
+                _console.print(f"  [dim][poly] skipped {stale} trades older than {MAX_TRADE_AGE_SECONDS}s[/dim]")
 
             # --- EXIT CHECK 2: Price target reached ---
             price_exits = self._check_exit_price_target()
